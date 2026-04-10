@@ -125,10 +125,17 @@ nba-statistics-model/
 ├─ src/
 │   ├─ data/
 │   │   ├─ fetch_games.py
+|   |   ├─ process.py
+|   |   ├─ features.py
 │   │
 │   ├─ models/
+|   |   ├─ train.py
+|   |   ├─ evaluate.py
 │   │
 │   └─ utils/
+        ├─ io.py
+        ├─ io.py
+
 │
 ├─ tests/
 │
