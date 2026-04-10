@@ -142,7 +142,7 @@ nba-statistics-model/
 └─ outputs/
     ├─ figures/
     └─ reports/
-
+```
 # Installation
 Clone the repository:
 ```bash
