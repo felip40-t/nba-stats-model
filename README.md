@@ -1,8 +1,6 @@
 # NBA Statistical Modelling Project
 
-NBA statistics modelling project using Python, pandas, and machine learning.
-
----
+> This project was constructed with the assistance of [Claude Code](https://claude.ai/code) by Anthropic.
 
 # Overview
 
@@ -84,24 +82,26 @@ Models will initially focus on interpretable methods such as:
 
 # Technologies Used
 
-Primary tools used in the project:
+### Data & Analysis
 
-- Python
-- pandas
-- numpy
-- scikit-learn
-- matplotlib
-- nba_api
+| Library | Description |
+|---|---|
+| [pandas](https://pandas.pydata.org/) | Data manipulation and analysis |
+| [numpy](https://numpy.org/) | Numerical computing |
+| [scikit-learn](https://scikit-learn.org/) | Machine learning models and utilities |
+| [matplotlib](https://matplotlib.org/) | Data visualisation |
+| [nba_api](https://github.com/swar/nba_api) | NBA Stats API client |
+| [pyarrow](https://arrow.apache.org/docs/python/) | Apache Parquet read/write (efficient data storage) |
 
-For efficient data storage:
+### Development Environment
 
-- Apache Parquet (`pyarrow`)
-
-Development environment:
-
-- VS Code
-- Git
-- GitHub
+| Tool | Description |
+|---|---|
+| [Python](https://www.python.org/) | Primary programming language |
+| [VS Code](https://code.visualstudio.com/) | Code editor |
+| [Git](https://git-scm.com/) | Version control |
+| [GitHub](https://github.com/) | Remote repository hosting |
+| [JupyterLab](https://jupyterlab.readthedocs.io/) | Interactive notebook environment |
 
 ---
 
@@ -133,9 +133,8 @@ nba-statistics-model/
 |   |   ├─ evaluate.py
 │   │
 │   └─ utils/
-        ├─ io.py
-        ├─ io.py
-
+|       ├─ io.py
+|
 │
 ├─ tests/
 │
