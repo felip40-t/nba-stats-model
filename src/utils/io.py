@@ -14,9 +14,13 @@ import pyarrow.parquet as pq
 # Project root: src/utils/io.py  →  ../../
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
-RAW_DIR = PROJECT_ROOT / "data" / "raw"
-INTERIM_DIR = PROJECT_ROOT / "data" / "interim"
-PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
+# Season subdirectory (e.g. "2025" for the 2024-25 season).
+# All raw/interim/processed paths are nested beneath data/<SEASON>/.
+SEASON = "2025"
+
+RAW_DIR = PROJECT_ROOT / "data" / SEASON / "raw"
+INTERIM_DIR = PROJECT_ROOT / "data" / SEASON / "interim"
+PROCESSED_DIR = PROJECT_ROOT / "data" / SEASON / "processed"
 
 
 def read_parquet(path: Path) -> pd.DataFrame:
@@ -57,6 +61,17 @@ def read_raw(filename: str) -> pd.DataFrame:
     return read_parquet(RAW_DIR / filename)
 
 
+def read_interim(filename: str) -> pd.DataFrame:
+    """Read a file from ``data/interim/`` by name.
+
+    Parameters
+    ----------
+    filename:
+        E.g. ``"game_log.parquet"``.
+    """
+    return read_parquet(INTERIM_DIR / filename)
+
+
 def write_interim(df: pd.DataFrame, filename: str) -> Path:
     """Write a DataFrame to ``data/interim/`` and return the resolved path.
 
@@ -68,5 +83,20 @@ def write_interim(df: pd.DataFrame, filename: str) -> Path:
         E.g. ``"game_log.parquet"``.
     """
     dest = INTERIM_DIR / filename
+    write_parquet(df, dest)
+    return dest
+
+
+def write_processed(df: pd.DataFrame, filename: str) -> Path:
+    """Write a DataFrame to ``data/processed/`` and return the resolved path.
+
+    Parameters
+    ----------
+    df:
+        DataFrame to serialise.
+    filename:
+        E.g. ``"team_features.parquet"``.
+    """
+    dest = PROCESSED_DIR / filename
     write_parquet(df, dest)
     return dest

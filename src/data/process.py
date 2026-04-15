@@ -21,6 +21,7 @@ Run from the project root::
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -41,8 +42,18 @@ from src.utils.io import read_raw, write_interim  # noqa: E402
 # ---------------------------------------------------------------------------
 
 def _snake(col: str) -> str:
-    """Convert a column name to snake_case."""
-    return col.strip().lower().replace(" ", "_")
+    """Convert a column name to snake_case.
+
+    Handles both ``UPPER_CASE`` (NBA API team-log style) and ``camelCase``
+    (NBA API box-score style) by inserting underscores before uppercase
+    letters that follow a lowercase letter or digit before lowercasing.
+    """
+    col = col.strip()
+    # Insert underscore before uppercase letters that follow a lowercase letter
+    # or digit (camelCase → snake_case).  UPPER_CASE is unaffected because
+    # consecutive capitals have no lowercase preceding them.
+    col = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", col)
+    return col.lower().replace(" ", "_")
 
 
 def _convert_minutes(val: str) -> float:
@@ -127,7 +138,7 @@ def _add_is_home(df: pd.DataFrame) -> pd.DataFrame:
     ``'TEAM @ OPP'``.
     """
     df = df.copy()
-    df["is_home"] = df["matchup"].str.contains(r"\bvs\.\b", regex=True)
+    df["is_home"] = df["matchup"].str.contains(r"vs\.", regex=True)
     return df
 
 

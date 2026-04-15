@@ -1,112 +1,125 @@
 """
 fetch_games.py — Step 1 of the ingestion pipeline.
 
-Fetches the first game of the 2024-25 NBA season and writes raw data
-to data/raw/ as Parquet files. Designed to be run from the project root:
+Fetches the first ``GAMES_PER_TEAM`` games of each team for the 2024-25
+NBA season and writes raw data to ``data/2025/raw/`` as Parquet files.
+
+Output files
+------------
+team_gamelog_raw.parquet
+    All team-game rows (both sides of each game) for the selected games.
+boxscore_raw.parquet
+    Combined player + team box-score rows for every selected game,
+    tagged with a ``stat_type`` column (``"player"`` / ``"team"``).
+
+Run from the project root::
 
     python src/data/fetch_games.py
 """
 
+import sys
 import time
 from pathlib import Path
 
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
-from nba_api.stats.endpoints import BoxScoreTraditionalV3, LeagueGameLog
 
-
-# Project root is two levels up from this file (src/data/fetch_games.py)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-RAW_DIR = PROJECT_ROOT / "data" / "raw"
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from nba_api.stats.endpoints import BoxScoreTraditionalV3, LeagueGameLog  # noqa: E402
+
+from src.utils.io import PROJECT_ROOT, RAW_DIR, write_parquet  # noqa: E402
+
+# Number of games to collect per team (from the start of the season).
+GAMES_PER_TEAM: int = 10
+
+# Minimum delay between NBA Stats API calls (seconds).
+# stats.nba.com enforces a soft rate limit; 0.6 s is sufficient for single-
+# script runs.  Increase to 1.0+ for batch back-fills to be safe.
+API_DELAY: float = 0.6
 
 
-# --- API calls -----------------------------------------------------------
+# ---------------------------------------------------------------------------
+# API helpers
+# ---------------------------------------------------------------------------
 
 def fetch_team_gamelog(season: str = "2024-25") -> pd.DataFrame:
-    """
-    Fetch every team-game entry for the given season via LeagueGameLog.
+    """Return the full team game-log for *season* (regular season only).
 
-    nba_api sends a browser-like User-Agent header automatically; no auth
-    needed. The endpoint returns one row per team per game, so each game
-    appears twice (once per side).
+    Each game appears twice — once per participating team.
     """
     log = LeagueGameLog(season=season, season_type_all_star="Regular Season")
-    df = log.get_data_frames()[0]
-    return df
+    return log.get_data_frames()[0]
+
+
+def get_first_n_game_ids(gamelog_df: pd.DataFrame, n: int) -> list[str]:
+    """Return unique game IDs covering the first *n* games of every team.
+
+    Sorts each team's appearances chronologically and takes the first *n*,
+    then returns the union of distinct ``GAME_ID`` values.  Because each
+    game is shared by two teams the total number of unique IDs is
+    typically around ``(n * 30) / 2``.
+    """
+    df = gamelog_df.copy()
+    df["GAME_DATE"] = pd.to_datetime(df["GAME_DATE"])
+    df = df.sort_values(["TEAM_ID", "GAME_DATE"])
+    first_n = df.groupby("TEAM_ID").head(n)
+    return sorted(first_n["GAME_ID"].unique().tolist())
 
 
 def fetch_boxscore(game_id: str) -> dict[str, pd.DataFrame]:
-    """
-    Fetch the traditional box score for a single game.
+    """Fetch the traditional box score for a single game.
 
-    BoxScoreTraditionalV2 returns multiple result sets; we keep:
-      - PlayerStats  (one row per player)
-      - TeamStats    (one row per team, two rows total)
+    Returns a dict with keys ``"player_stats"`` and ``"team_stats"``.
     """
     box = BoxScoreTraditionalV3(game_id=game_id)
     frames = box.get_data_frames()
-    return {
-        "player_stats": frames[0],
-        "team_stats": frames[1],
-    }
+    return {"player_stats": frames[0], "team_stats": frames[1]}
 
 
-# --- Isolation logic -----------------------------------------------------
-
-def get_first_game(gamelog_df: pd.DataFrame) -> tuple[str, str]:
-    """
-    Return (game_id, game_date) for the earliest game in the log.
-
-    GAME_DATE comes back as a string ('2024-10-22'), so lexicographic
-    sort is fine for finding the minimum date.
-    """
-    earliest_date = gamelog_df["GAME_DATE"].min()
-    first_game_row = gamelog_df[gamelog_df["GAME_DATE"] == earliest_date].iloc[0]
-    return first_game_row["GAME_ID"], earliest_date
-
-
-# --- File I/O ------------------------------------------------------------
-
-def write_parquet(df: pd.DataFrame, path: Path) -> None:
-    """Write a DataFrame to Parquet, creating parent directories as needed."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    table = pa.Table.from_pandas(df, preserve_index=False)
-    pq.write_table(table, path)
-
-
-# --- Orchestration -------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Orchestration
+# ---------------------------------------------------------------------------
 
 def main() -> None:
-    print("Fetching team game log for 2024-25 season...")
-    gamelog_df = fetch_team_gamelog(season="2024-25")
+    season = "2024-25"
+    print(f"Fetching team game log for {season} season...")
+    gamelog_df = fetch_team_gamelog(season=season)
+    n_teams = gamelog_df["TEAM_ID"].nunique()
+    print(f"  Full log: {len(gamelog_df)} rows across {n_teams} teams")
 
-    game_id, game_date = get_first_game(gamelog_df)
-    print(f"First game of season: {game_date}  (GAME_ID={game_id})")
+    game_ids = get_first_n_game_ids(gamelog_df, GAMES_PER_TEAM)
+    print(f"  First {GAMES_PER_TEAM} games per team → {len(game_ids)} unique games")
 
-    # Isolate the two rows for that game before writing
-    first_game_rows = gamelog_df[gamelog_df["GAME_ID"] == game_id].copy()
-
+    # Write the gamelog rows for the selected games (both team sides)
+    selected_rows = gamelog_df[gamelog_df["GAME_ID"].isin(game_ids)].copy()
     gamelog_path = RAW_DIR / "team_gamelog_raw.parquet"
-    write_parquet(first_game_rows, gamelog_path)
-    print(f"  -> saved team gamelog to {gamelog_path.relative_to(PROJECT_ROOT)}")
+    write_parquet(selected_rows, gamelog_path)
+    print(f"  -> saved team gamelog ({len(selected_rows)} rows) "
+          f"to {gamelog_path.relative_to(PROJECT_ROOT)}")
 
-    # nba_api's stats.nba.com backend enforces a soft rate limit;
-    # 0.6 s is enough to avoid 429s during normal single-script runs.
-    time.sleep(0.6)
+    # Fetch box scores for every unique game
+    print(f"\nFetching {len(game_ids)} box scores "
+          f"(~{len(game_ids) * API_DELAY:.0f}s with rate limiting)...")
+    all_frames: list[pd.DataFrame] = []
+    for i, game_id in enumerate(game_ids, 1):
+        print(f"  [{i:3d}/{len(game_ids)}] {game_id}", end="\r", flush=True)
+        boxscore = fetch_boxscore(game_id)
+        boxscore["player_stats"]["stat_type"] = "player"
+        boxscore["team_stats"]["stat_type"] = "team"
+        combined = pd.concat(
+            [boxscore["player_stats"], boxscore["team_stats"]],
+            ignore_index=True,
+        )
+        all_frames.append(combined)
+        time.sleep(API_DELAY)
 
-    print("Fetching box score...")
-    boxscore = fetch_boxscore(game_id)
-
+    boxscore_df = pd.concat(all_frames, ignore_index=True)
     boxscore_path = RAW_DIR / "boxscore_raw.parquet"
-    # Combine player and team stats into one file with a 'stat_type' column
-    boxscore["player_stats"]["stat_type"] = "player"
-    boxscore["team_stats"]["stat_type"] = "team"
-    combined = pd.concat(
-        [boxscore["player_stats"], boxscore["team_stats"]], ignore_index=True
-    )
-    write_parquet(combined, boxscore_path)
-    print(f"  -> saved box score to   {boxscore_path.relative_to(PROJECT_ROOT)}")
+    write_parquet(boxscore_df, boxscore_path)
+    print(f"\n  -> saved box scores ({len(boxscore_df)} rows) "
+          f"to {boxscore_path.relative_to(PROJECT_ROOT)}")
 
     print("\nDone.")
 

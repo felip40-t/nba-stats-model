@@ -22,57 +22,91 @@ This repository focuses on **building a clear and extensible workflow**, rather 
 
 # Project Goals
 
-The project progresses through several stages. The main aim is to have a working software in time for the 2026 NBA playoffs.
+The project progresses through several stages. The main aim is to have working software ready for the **2026 NBA playoffs**.
 
 ## 1. Data Ingestion
 
 Retrieve raw NBA statistics using `nba_api`.
 
-Examples of collected data include:
+Data collected per season includes:
 
-- Team game logs
-- Player game logs
-- Box score statistics
-- Advanced team metrics
+- Team game logs (`LeagueGameLog`) — one row per team per game
+- Box scores (`BoxScoreTraditionalV3`) — player and team splits per game
+- Advanced team metrics derived from box-score totals
 
-Raw datasets are stored locally and versioned through the project pipeline.
+Raw datasets are stored locally as Apache Parquet files under `data/<season>/raw/`.
 
 ---
 
 ## 2. Data Processing
 
-Clean and transform raw datasets into structured tables suitable for analysis.
+Clean and transform raw datasets into structured interim tables.
 
-Examples:
+Current interim tables (written to `data/<season>/interim/`):
 
-- Game-level datasets
-- Team game statistics
-- Player game statistics
-
-Feature engineering will include rolling averages and contextual game information.
+| Table | Description |
+|---|---|
+| `game_log.parquet` | One row per team per game with contextual flags (`is_home`, `win`, `is_back_to_back`) |
+| `player_game_log.parquet` | One row per player per game with box-score stats and decimal minutes |
+| `team_advanced.parquet` | Aggregated team totals per game with efficiency metrics (TS%, 3P rate, FT rate, OREB%) |
 
 ---
 
-## 3. Exploratory Analysis
+## 3. Feature Engineering
 
-Analyse statistical patterns such as:
+Transform interim tables into model-ready features (written to `data/<season>/processed/`).
+
+### Team features (`team_features.parquet`)
+
+Expanding-window season averages computed from games *prior to* the current one (no data leakage):
+
+- Box-score rolling averages: points, rebounds, assists, steals, blocks, turnovers, FG%, 3P%, FT%, plus-minus
+- Efficiency rolling averages: true shooting %, three-point rate, free-throw rate, OREB%
+- `season_win_rate` — win percentage entering the game
+- `games_played` — number of games played before this one
+
+### Player features (`player_features.parquet`)
+
+Rolling season averages (same expanding, shift-by-1 approach) for points, rebounds, assists, minutes, and shooting splits, plus two fatigue metrics:
+
+**`fatigue_decay`** — Exponential decay load model:
+
+```
+fatigue_i = Σ_{j < i}  minutes_j · e^{-λ · (date_i − date_j)}
+```
+
+Where `λ = 0.2 day⁻¹` (configurable via `FATIGUE_LAMBDA` in `features.py`). Recent high-minute games contribute the most; load from distant games fades exponentially. A player on a back-to-back carries nearly the full weight of their previous game; after a 5-day break that game contributes only ~37% of its original load.
+
+**`acwr`** — Acute:Chronic Workload Ratio:
+
+```
+acwr = (7-day rolling minutes) / (28-day rolling minutes / 4)
+```
+
+Both windows exclude the current game. Values above 1.0 signal an acute workload spike above the player's chronic baseline, which sports science literature associates with elevated injury risk.
+
+---
+
+## 4. Exploratory Analysis
+
+Planned analysis of statistical patterns including:
 
 - Team offensive and defensive performance trends
 - Home vs away performance
 - Back-to-back scheduling effects
-- Player usage and efficiency trends
+- Player usage, fatigue, and efficiency trends
 
 ---
 
-## 4. Predictive Modelling
+## 5. Predictive Modelling
 
-Build baseline predictive models such as:
+Planned baseline predictive models:
 
 - Team win probability
 - Team points scored
 - Player scoring thresholds
 
-Models will initially focus on interpretable methods such as:
+Models will initially focus on interpretable methods:
 
 - Logistic regression
 - Linear regression
@@ -105,7 +139,6 @@ Models will initially focus on interpretable methods such as:
 
 ---
 
-
 # Project Structure
 
 ```text
@@ -116,25 +149,25 @@ nba-statistics-model/
 ├─ .gitignore
 │
 ├─ data/
-│   ├─ raw/
-│   ├─ interim/
-│   └─ processed/
+│   └─ 2025/                    ← season subdirectory (2024-25 season)
+│       ├─ raw/                  ← fetched from nba_api, never edited
+│       ├─ interim/              ← cleaned & restructured by process.py
+│       └─ processed/            ← model-ready features from features.py
 │
 ├─ notebooks/
 │
 ├─ src/
 │   ├─ data/
-│   │   ├─ fetch_games.py
-|   |   ├─ process.py
-|   |   ├─ features.py
+│   │   ├─ fetch_games.py        ← Stage 1: ingest raw data from nba_api
+│   │   ├─ process.py            ← Stage 2: clean raw → interim tables
+│   │   └─ features.py           ← Stage 3: feature engineering → processed tables
 │   │
 │   ├─ models/
-|   |   ├─ train.py
-|   |   ├─ evaluate.py
+│   │   ├─ train.py
+│   │   └─ evaluate.py
 │   │
 │   └─ utils/
-|       ├─ io.py
-|
+│       └─ io.py                 ← shared path constants and Parquet helpers
 │
 ├─ tests/
 │
@@ -142,25 +175,26 @@ nba-statistics-model/
     ├─ figures/
     └─ reports/
 ```
+
+The active season is controlled by the `SEASON` constant in `src/utils/io.py`. All path helpers (`read_raw`, `read_interim`, `write_processed`, etc.) resolve beneath `data/<SEASON>/` automatically.
+
+---
+
 # Installation
+
 Clone the repository:
+
 ```bash
 git clone https://github.com/felip40-t/nba-stats-model.git
 cd nba-stats-model
 ```
 
-Create a virtual environment:
+Create and activate a virtual environment:
 
 ```bash
 python -m venv .venv
-```
-
-Activate the environment.
-
-Windows:
-
-```bash
-.venv\Scripts\activate
+source .venv/bin/activate        # Linux / macOS
+.venv\Scripts\activate           # Windows
 ```
 
 Install dependencies:
@@ -171,21 +205,22 @@ pip install -r requirements.txt
 
 ---
 
-# Running the Project
+# Running the Pipeline
 
-Data collection scripts are located in:
-
-```text
-src/data/
-```
-
-Example usage:
+All scripts are run from the project root. Run them in order:
 
 ```bash
+# Stage 1 — fetch raw data from nba_api (~90s for 10 games/team)
 python src/data/fetch_games.py
+
+# Stage 2 — clean raw data into interim tables
+python src/data/process.py
+
+# Stage 3 — feature engineering into processed tables
+python src/data/features.py
 ```
 
-This script downloads NBA game data and stores it in the `data/raw` directory.
+Output is written to `data/2025/{raw,interim,processed}/` respectively.
 
 ---
 
