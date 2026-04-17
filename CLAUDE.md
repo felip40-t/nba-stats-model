@@ -19,19 +19,18 @@ pip install -r requirements.txt
 All scripts run from the project root, in order:
 
 ```bash
-# Stage 0 — fetch full season schedule (unplayed games included, needed for predictions)
-python src/data/fetch_schedule.py
-
-# Stage 1 — fetch raw data from nba_api (~20 min for full season, rate-limited)
+# Stage 1 — fetch schedule + raw data from nba_api (~20 min for full season, rate-limited)
 python src/data/fetch_games.py
+# To fetch only the schedule: python src/data/fetch_games.py --schedule-only
+# Incremental update: python src/data/fetch_games.py --update
 
 # Stage 2 — clean raw → interim tables (game_log, player_game_log, team_advanced)
 python src/data/process.py
 
-# Stage 3 — feature engineering → processed tables (team_features, player_features)
+# Stage 3 — feature engineering → processed tables (team_features, player_features, elo_ratings)
 python src/data/features.py
 
-# Stage 4 — train logistic regression win-probability model
+# Stage 4 — rolling day-by-day training simulation
 python src/models/train.py
 
 # Stage 5 — evaluate model (metrics + calibration/coefficient plots)
@@ -49,8 +48,7 @@ python -m pytest tests/test_foo.py::test_bar  # single test
 
 ### Data pipeline stages
 
-0. **Schedule** (`src/data/fetch_schedule.py`) — Calls `ScheduleLeagueV2` from `nba_api`. Writes `schedule.parquet` to `data/<SEASON>/raw/`. Includes future unplayed games (null scores) used to frame predictions.
-1. **Ingestion** (`src/data/fetch_games.py`) — Calls `LeagueGameLog` and `BoxScoreTraditionalV3` from `nba_api`. Writes `team_gamelog_raw.parquet` and `boxscore_raw.parquet` to `data/<SEASON>/raw/`.
+1. **Ingestion** (`src/data/fetch_games.py`) — Calls `ScheduleLeagueV2`, `LeagueGameLog`, and `BoxScoreTraditionalV3` from `nba_api`. Writes `schedule.parquet`, `team_gamelog_raw.parquet`, and `boxscore_raw.parquet` to `data/<SEASON>/raw/`. Supports `--schedule-only`, `--update` (incremental), and `--playoffs` flags.
 2. **Processing** (`src/data/process.py`) — Cleans and restructures raw files into three interim tables in `data/<SEASON>/interim/`: `game_log.parquet` (team-per-game with `is_home`, `win`, `is_back_to_back` flags), `player_game_log.parquet` (player-per-game with `minutes_decimal`), `team_advanced.parquet` (aggregated team totals + TS%, 3P rate, FT rate, OREB%).
 3. **Feature engineering** (`src/data/features.py`) — Reads interim tables and produces `team_features.parquet`, `player_features.parquet`, and `elo_ratings.parquet` in `data/<SEASON>/processed/`. Also computes per-team Elo ratings (`elo_pre`, `elo_post`, `home_adv`) and team-level fatigue aggregates (`team_fatigue`, `team_acwr`). Exposes `compute_features_from_data()` for in-memory computation with an optional `cutoff_date`; disk writes only happen when run directly (no cutoff = end-of-season snapshot).
 4. **Training** (`src/models/train.py`) — Rolling day-by-day simulation: for each game date `d`, recomputes features in memory for all games ≤ `d`, trains on games before `d`, predicts games on `d`. Saves `outputs/models/win_probability_logreg.joblib` (final model, full season) and `outputs/models/rolling_predictions.parquet` (each game predicted once using only prior data).
