@@ -21,6 +21,7 @@ Run from the project root::
 
 from __future__ import annotations
 
+import argparse
 import re
 import sys
 from pathlib import Path
@@ -318,7 +319,10 @@ def _print_table(title: str, df: pd.DataFrame, max_cols: int = 12) -> None:
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
-def run_pipeline(verbose: bool = True) -> dict[str, pd.DataFrame]:
+def run_pipeline(
+    playoffs: bool = False,
+    verbose: bool = True,
+) -> dict[str, pd.DataFrame]:
     """Execute the full processing pipeline and return the three output tables.
 
     Reads raw files, applies all cleaning and transformation functions, saves
@@ -327,6 +331,10 @@ def run_pipeline(verbose: bool = True) -> dict[str, pd.DataFrame]:
 
     Parameters
     ----------
+    playoffs:
+        If True, read ``*_playoffs.parquet`` raw files and write
+        ``*_playoffs.parquet`` interim files.  Otherwise operate on the
+        regular-season files.
     verbose:
         If True, print table previews and file paths to stdout.
 
@@ -334,16 +342,19 @@ def run_pipeline(verbose: bool = True) -> dict[str, pd.DataFrame]:
     -------
     dict with keys ``"game_log"``, ``"player_game_log"``, ``"team_advanced"``.
     """
-    if verbose:
-        print("Loading raw data...")
-
-    gamelog_raw = read_raw("team_gamelog_raw.parquet")
-    boxscore_raw = read_raw("boxscore_raw.parquet")
+    suffix = "_playoffs" if playoffs else ""
 
     if verbose:
-        print(f"  team_gamelog_raw : {gamelog_raw.shape[0]} rows, "
+        label = "playoffs" if playoffs else "regular-season"
+        print(f"Loading raw {label} data...")
+
+    gamelog_raw = read_raw(f"team_gamelog_raw{suffix}.parquet")
+    boxscore_raw = read_raw(f"boxscore_raw{suffix}.parquet")
+
+    if verbose:
+        print(f"  team_gamelog_raw{suffix} : {gamelog_raw.shape[0]} rows, "
               f"{gamelog_raw.shape[1]} cols")
-        print(f"  boxscore_raw     : {boxscore_raw.shape[0]} rows, "
+        print(f"  boxscore_raw{suffix}     : {boxscore_raw.shape[0]} rows, "
               f"{boxscore_raw.shape[1]} cols")
 
     # --- transform ----------------------------------------------------------
@@ -362,15 +373,15 @@ def run_pipeline(verbose: bool = True) -> dict[str, pd.DataFrame]:
         print("\nSaving to data/interim/ ...")
 
     for name, df in outputs.items():
-        dest = write_interim(df, f"{name}.parquet")
+        dest = write_interim(df, f"{name}{suffix}.parquet")
         if verbose:
             print(f"  -> {dest.relative_to(PROJECT_ROOT)}")
 
     # --- display ------------------------------------------------------------
     if verbose:
-        _print_table("game_log", game_log)
-        _print_table("player_game_log", player_game_log)
-        _print_table("team_advanced", team_advanced)
+        _print_table(f"game_log{suffix}", game_log)
+        _print_table(f"player_game_log{suffix}", player_game_log)
+        _print_table(f"team_advanced{suffix}", team_advanced)
 
     return outputs
 
@@ -379,5 +390,16 @@ def run_pipeline(verbose: bool = True) -> dict[str, pd.DataFrame]:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Clean raw NBA data into interim tables.")
+    p.add_argument(
+        "--playoffs",
+        action="store_true",
+        help="Process the playoffs raw files (boxscore_raw_playoffs.parquet etc).",
+    )
+    return p.parse_args(argv)
+
+
 if __name__ == "__main__":
-    run_pipeline(verbose=True)
+    args = _parse_args()
+    run_pipeline(playoffs=args.playoffs, verbose=True)

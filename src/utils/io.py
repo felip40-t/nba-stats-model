@@ -22,6 +22,28 @@ RAW_DIR = PROJECT_ROOT / "data" / SEASON / "raw"
 INTERIM_DIR = PROJECT_ROOT / "data" / SEASON / "interim"
 PROCESSED_DIR = PROJECT_ROOT / "data" / SEASON / "processed"
 
+OUTPUTS_DIR = PROJECT_ROOT / "outputs"
+MODELS_DIR = OUTPUTS_DIR / "models"
+FIGURES_DIR = OUTPUTS_DIR / "figures"
+
+
+def season_api(season: str = SEASON) -> str:
+    """Convert a season directory label to the nba_api format.
+
+    The project stores data under ``data/<SEASON>/`` where ``SEASON`` is the
+    *ending* year (e.g. ``"2025"`` for the 2024-25 season).  The nba_api
+    endpoints expect the hyphenated form (``"2024-25"``).
+
+    Examples
+    --------
+    >>> season_api("2025")
+    '2024-25'
+    >>> season_api("2026")
+    '2025-26'
+    """
+    year = int(season)
+    return f"{year - 1}-{str(year)[2:]}"
+
 
 def read_parquet(path: Path) -> pd.DataFrame:
     """Read a Parquet file and return a DataFrame.
@@ -61,6 +83,26 @@ def read_raw(filename: str) -> pd.DataFrame:
     return read_parquet(RAW_DIR / filename)
 
 
+def write_raw(df: pd.DataFrame, filename: str) -> Path:
+    """Write a DataFrame to ``data/raw/`` and return the resolved path.
+
+    Parameters
+    ----------
+    df:
+        DataFrame to serialise.
+    filename:
+        E.g. ``"schedule.parquet"``.
+    """
+    dest = RAW_DIR / filename
+    write_parquet(df, dest)
+    return dest
+
+
+def read_schedule() -> pd.DataFrame:
+    """Read the season schedule from ``data/raw/schedule.parquet``."""
+    return read_raw("schedule.parquet")
+
+
 def read_interim(filename: str) -> pd.DataFrame:
     """Read a file from ``data/interim/`` by name.
 
@@ -85,6 +127,17 @@ def write_interim(df: pd.DataFrame, filename: str) -> Path:
     dest = INTERIM_DIR / filename
     write_parquet(df, dest)
     return dest
+
+
+def read_processed(filename: str) -> pd.DataFrame:
+    """Read a file from ``data/processed/`` by name.
+
+    Parameters
+    ----------
+    filename:
+        E.g. ``"team_features.parquet"``.
+    """
+    return read_parquet(PROCESSED_DIR / filename)
 
 
 def write_processed(df: pd.DataFrame, filename: str) -> Path:

@@ -30,6 +30,7 @@ Retrieve raw NBA statistics using `nba_api`.
 
 Data collected per season includes:
 
+- Full season schedule (`ScheduleLeagueV2`) — all games including future unplayed ones, used to frame predictions
 - Team game logs (`LeagueGameLog`) — one row per team per game
 - Box scores (`BoxScoreTraditionalV3`) — player and team splits per game
 - Advanced team metrics derived from box-score totals
@@ -65,6 +66,40 @@ Expanding-window season averages computed from games *prior to* the current one 
 - `season_win_rate` — win percentage entering the game
 - `games_played` — number of games played before this one
 
+**Elo ratings** — computed by replaying all games chronologically using the classic Elo formula:
+
+```
+expected_home = 1 / (1 + 10 ^ ((R_away − (R_home + H)) / 400))
+R'            = R + K · (S − expected)
+```
+
+Where `S` is 1 for a win, 0 for a loss.  The home-court bonus `H` is **team-specific**, scaling with the home team's season-to-date home win rate (prior games only — no leakage):
+
+```
+H = max(HOME_ADV_MIN, HOME_ADV_BASE + (home_win_rate − 0.5) × HOME_ADV_SCALE)
+```
+
+Teams with a strong home record get a larger bonus; teams at the bottom of the league are floored at `HOME_ADV_MIN`.  Teams with no prior home games start at the league-average prior (`.500`).
+
+Four columns are produced per team-game row:
+
+| Column | Description |
+|---|---|
+| `elo_pre` | Team's Elo rating entering the game (safe as a model feature — no leakage) |
+| `elo_post` | Updated rating after the result |
+| `opp_elo_pre` | Opponent's pre-game Elo |
+| `home_adv` | Home-court bonus applied in this game (home team only; `NaN` for away) |
+
+Tunable constants in `features.py`:
+
+| Constant | Default | Purpose |
+|---|---|---|
+| `ELO_INITIAL` | `1500.0` | Starting rating for every team |
+| `ELO_K` | `20.0` | Update step size (standard for season-length sports) |
+| `ELO_HOME_ADV_BASE` | `100.0` | Advantage for a team with a .500 home record |
+| `ELO_HOME_ADV_SCALE` | `100.0` | Sensitivity to home win rate (full range: 50–150 pts) |
+| `ELO_HOME_ADV_MIN` | `50.0` | Floor applied to the worst home-record teams |
+
 ### Player features (`player_features.parquet`)
 
 Rolling season averages (same expanding, shift-by-1 approach) for points, rebounds, assists, minutes, and shooting splits, plus two fatigue metrics:
@@ -87,30 +122,34 @@ Both windows exclude the current game. Values above 1.0 signal an acute workload
 
 ---
 
-## 4. Exploratory Analysis
+## 4. Predictive Modelling
 
-Planned analysis of statistical patterns including:
+### Baseline model — logistic regression win probability
 
-- Team offensive and defensive performance trends
-- Home vs away performance
-- Back-to-back scheduling effects
-- Player usage, fatigue, and efficiency trends
+A `StandardScaler + LogisticRegression` pipeline trains on all played historical games. The train/test split is strictly chronological (80% train / 20% test) to simulate forward-looking prediction quality.
 
----
+**Model inputs** (all computed as home − away deltas):
 
-## 5. Predictive Modelling
+| Feature | Description |
+|---|---|
+| `elo_delta` | `home_elo_pre − away_elo_pre` |
+| `home_adv` | Home team's team-specific Elo home-court bonus |
+| `win_rate_delta` | Season win rate differential |
+| `pts_delta` | Season average points differential |
+| `fg_pct_delta` | Season FG% differential |
+| `fatigue_delta` | Team fatigue differential |
+| `acwr_delta` | ACWR differential |
 
-Planned baseline predictive models:
+**Outputs** (written to `outputs/`):
 
-- Team win probability
-- Team points scored
-- Player scoring thresholds
+| File | Description |
+|---|---|
+| `models/win_probability_logreg.joblib` | Fitted scikit-learn pipeline |
+| `models/test_predictions.parquet` | Predicted probabilities on the test set |
+| `figures/calibration_curve.png` | Predicted probability vs actual win rate |
+| `figures/feature_coefficients.png` | Model coefficients sorted by magnitude |
 
-Models will initially focus on interpretable methods:
-
-- Logistic regression
-- Linear regression
-- Tree-based models
+**Evaluation metrics:** log-loss, Brier score, accuracy printed to console.
 
 ---
 
@@ -158,13 +197,14 @@ nba-statistics-model/
 │
 ├─ src/
 │   ├─ data/
+│   │   ├─ fetch_schedule.py     ← Stage 0: fetch full season schedule
 │   │   ├─ fetch_games.py        ← Stage 1: ingest raw data from nba_api
 │   │   ├─ process.py            ← Stage 2: clean raw → interim tables
 │   │   └─ features.py           ← Stage 3: feature engineering → processed tables
 │   │
 │   ├─ models/
-│   │   ├─ train.py
-│   │   └─ evaluate.py
+│   │   ├─ train.py              ← Stage 4: train logistic regression model
+│   │   └─ evaluate.py          ← Stage 5: evaluate and plot model metrics
 │   │
 │   └─ utils/
 │       └─ io.py                 ← shared path constants and Parquet helpers
@@ -172,8 +212,8 @@ nba-statistics-model/
 ├─ tests/
 │
 └─ outputs/
-    ├─ figures/
-    └─ reports/
+    ├─ models/                   ← fitted model + test predictions
+    └─ figures/                  ← calibration curve, feature coefficients
 ```
 
 The active season is controlled by the `SEASON` constant in `src/utils/io.py`. All path helpers (`read_raw`, `read_interim`, `write_processed`, etc.) resolve beneath `data/<SEASON>/` automatically.
