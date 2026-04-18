@@ -89,6 +89,12 @@ BULK_THRESHOLD: int = 100
 # crash mid-fetch doesn't lose progress (resume with --update).
 CHECKPOINT_EVERY: int = 100
 
+# Retry / cooldown settings for long back-fills.
+MAX_RETRIES: int = 3          # attempts per game before giving up
+RETRY_BACKOFF_BASE: float = 5.0  # seconds; doubles each attempt (5 → 10 → 20)
+COOLDOWN_EVERY: int = 200     # games between long pauses
+COOLDOWN_SECONDS: float = 30.0   # pause duration to let the rate-limit window reset
+
 
 # ---------------------------------------------------------------------------
 # Schedule
@@ -287,11 +293,23 @@ def run(
     failed: list[str] = []
     for i, game_id in enumerate(new_game_ids, 1):
         print(f"  [{i:4d}/{len(new_game_ids)}] {game_id}", end="\r", flush=True)
-        try:
-            boxscore = fetch_boxscore(game_id)
-        except Exception as exc:  # noqa: BLE001 — surface network/API errors but keep going
-            print(f"\n  WARN: failed to fetch {game_id}: {exc}")
-            failed.append(game_id)
+
+        # Exponential-backoff retry so transient errors don't permanently skip a game.
+        boxscore = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                boxscore = fetch_boxscore(game_id)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt < MAX_RETRIES:
+                    wait = RETRY_BACKOFF_BASE * (2 ** (attempt - 1))
+                    print(f"\n  WARN: {game_id} attempt {attempt} failed ({exc}); retrying in {wait:.0f}s...")
+                    time.sleep(wait)
+                else:
+                    print(f"\n  WARN: {game_id} failed after {MAX_RETRIES} attempts — skipping.")
+                    failed.append(game_id)
+
+        if boxscore is None:
             time.sleep(delay)
             continue
 
@@ -306,7 +324,12 @@ def run(
         if i % CHECKPOINT_EVERY == 0:
             _checkpoint()
 
-        time.sleep(delay)
+        # Periodic cooldown to reset the server-side rate-limit window.
+        if i % COOLDOWN_EVERY == 0:
+            print(f"\n  Cooldown: pausing {COOLDOWN_SECONDS:.0f}s after {i} games...")
+            time.sleep(COOLDOWN_SECONDS)
+        else:
+            time.sleep(delay)
 
     # Final snapshot
     _checkpoint()

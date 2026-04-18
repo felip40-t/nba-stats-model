@@ -17,6 +17,13 @@ team_advanced.parquet
 Run from the project root::
 
     python src/data/process.py
+
+Playoff data is NOT processed automatically. Pass ``--playoffs`` to read
+``*_playoffs.parquet`` raw files and write ``*_playoffs.parquet`` interim
+files (e.g. ``game_log_playoffs.parquet``). Fetch playoff raw data first
+with ``python src/data/fetch_games.py --playoffs``::
+
+    python src/data/process.py --playoffs
 """
 
 from __future__ import annotations
@@ -82,6 +89,8 @@ def clean_game_log(df: pd.DataFrame) -> pd.DataFrame:
 
     Standardises column names, parses dates, casts dtypes, and derives
     three contextual flags: ``is_home``, ``win``, and ``is_back_to_back``.
+    ``num_ot`` is added later in ``run_pipeline`` because it requires
+    player-minute data from the box-score.
 
     Parameters
     ----------
@@ -163,6 +172,28 @@ def _add_is_back_to_back(df: pd.DataFrame) -> pd.DataFrame:
     prev_date = df.groupby("team_id")["game_date"].shift(1)
     df["is_back_to_back"] = (df["game_date"] - prev_date).dt.days == 1
     return df
+
+
+def _compute_num_ot(player_game_log: pd.DataFrame) -> pd.DataFrame:
+    """Derive the number of overtime periods per game from summed player minutes.
+
+    NBA regulation = 5 players × 48 min = 240 player-minutes per team.
+    Each OT period adds 5 × 5 = 25 player-minutes.  We take the max across
+    both teams to guard against foul-outs slightly reducing one team's count.
+
+    Returns a DataFrame with columns ``game_id`` and ``num_ot``.
+    """
+    team_mins = (
+        player_game_log
+        .groupby(["game_id", "team_id"])["minutes_decimal"]
+        .sum()
+        .reset_index(name="total_mins")
+    )
+    game_mins = team_mins.groupby("game_id")["total_mins"].max().reset_index(name="max_mins")
+    game_mins["num_ot"] = (
+        ((game_mins["max_mins"] - 240) / 25).clip(lower=0).round().astype("Int64")
+    )
+    return game_mins[["game_id", "num_ot"]]
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +392,15 @@ def run_pipeline(
     game_log = clean_game_log(gamelog_raw)
     player_game_log = clean_player_game_log(boxscore_raw)
     team_advanced = build_team_advanced(boxscore_raw)
+
+    # --- add num_ot (requires player minutes from boxscore) -----------------
+    num_ot_df = _compute_num_ot(player_game_log)
+    game_log = game_log.merge(num_ot_df, on="game_id", how="left")
+    # Place num_ot immediately after is_back_to_back
+    cols = list(game_log.columns)
+    cols.remove("num_ot")
+    cols.insert(cols.index("is_back_to_back") + 1, "num_ot")
+    game_log = game_log[cols]
 
     # --- save ---------------------------------------------------------------
     outputs = {

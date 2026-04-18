@@ -14,23 +14,24 @@ The target milestone is **working software ready for the 2026 NBA playoffs**.
 
 ## Current Status
 
-**Version 1.0** — The full pipeline is operational end-to-end on test data (2024-25 season). The rolling training simulation has been designed and coded; further refinements are needed before running it on a full season. See [Roadmap](#roadmap) for what is still to be done.
+**Version 1.0** — The full pipeline is operational end-to-end on test data (2024-25 season). The rolling training simulation is fully implemented; further refinements are needed before running it on a full season. See [Roadmap](#roadmap) for what is still to be done.
 
 | Stage | Status |
 |---|---|
 | Raw data ingestion (schedule + game logs + box scores) | Done |
 | Data processing | Done |
 | Feature engineering (team + player) | Done |
-| Elo ratings (team-specific home advantage) | Done |
+| Elo ratings (team-specific home advantage, MOV-adjusted) | Done |
 | Player fatigue metrics (decay + ACWR) | Done |
-| Rolling day-by-day training simulation | Designed, needs optimisation |
-| Model evaluation | Done (pending full-season run) |
+| Rolling day-by-day training simulation | Done |
+| Playoffs model (full regular-season train) | Done |
+| Model evaluation (metrics + 9 diagnostic plots) | Done (pending full-season run) |
 
 ---
 
 ## Pipeline Architecture
 
-Data flows through four sequential scripts. All are run from the project root.
+Data flows through five sequential scripts. All are run from the project root.
 
 ```
 fetch_games.py  →  process.py  →  features.py  →  train.py  →  evaluate.py
@@ -51,7 +52,10 @@ Fetches the season schedule, team game-logs, and player/team box scores from `nb
 - Default full run: fetches schedule + all game box scores (~20 min for a full season, rate-limited)
 - `--schedule-only`: fetch only the schedule, skip box scores
 - `--update`: incremental — only fetch game IDs not already on disk (use daily to pick up new results)
-- `--playoffs`: same behaviour but queries the Playoffs season type
+- `--playoffs`: same behaviour but queries the Playoffs season type; writes `_playoffs` files
+- `--api-delay SEC`: override the per-call delay (default 0.6 s; auto-raised to 1.0 s for runs > 100 new games)
+
+For playoffs, the gamelog and boxscore files carry a `_playoffs` suffix (e.g. `boxscore_raw_playoffs.parquet`).
 
 ### Stage 2 — Processing (`src/data/process.py`)
 
@@ -59,9 +63,11 @@ Cleans and restructures raw files into three interim tables in `data/<SEASON>/in
 
 | Table | Description |
 |---|---|
-| `game_log.parquet` | One row per team per game with `is_home`, `win`, `is_back_to_back` flags |
+| `game_log.parquet` | One row per team per game with `is_home`, `win`, `is_back_to_back`, `num_ot` flags |
 | `player_game_log.parquet` | One row per player per game with box-score stats and decimal minutes |
 | `team_advanced.parquet` | Per-game team totals with efficiency metrics (TS%, 3P rate, FT rate, OREB%) |
+
+`num_ot` is derived from summed player-minutes: regulation = 240 per team, each OT adds 25. Pass `--playoffs` to process the `_playoffs` raw files and write `_playoffs` interim files.
 
 ### Stage 3 — Feature Engineering (`src/data/features.py`)
 
@@ -69,7 +75,7 @@ Reads interim tables and produces model-ready features in `data/<SEASON>/process
 
 **`team_features.parquet`** — one row per team per game:
 
-- Expanding season averages: points, rebounds, assists, steals, blocks, turnovers, FG%, 3P%, FT%, plus-minus, TS%, 3P rate, FT rate, OREB%
+- Expanding season averages: points, rebounds (total + offensive), assists, steals, blocks, turnovers, personal fouls, FTA, FG%, 3P%, FT%, plus-minus, TS%, 3P rate, FT rate, OREB%
 - `season_win_rate`, `games_played` (both entering the current game)
 - Elo ratings: `elo_pre`, `elo_post`, `opp_elo_pre`, `home_adv`
 - Team-level fatigue aggregates: `team_fatigue`, `team_acwr`
@@ -79,16 +85,22 @@ Reads interim tables and produces model-ready features in `data/<SEASON>/process
 - Expanding season averages for all box-score stats
 - `days_rest`, `fatigue_decay`, `acwr`
 
-**`elo_ratings.parquet`** — one row per team per game for the full season (~82 rows per team), containing `game_date`, `team_id`, `elo_pre`, `elo_post`. Used to plot how each team's Elo evolves over the season.
+**`elo_ratings.parquet`** — one row per team per game for the full season (~82 rows per team), containing `game_id`, `game_date`, `team_id`, `elo_pre`, `elo_post`. Used by `evaluate.py` to plot how each team's Elo evolves over the season.
+
+Pass `--playoffs` to load `*_playoffs.parquet` interim files alongside the regular-season tables. Regular-season data is always included so Elo ratings carry over and rolling averages are not cold-started. Outputs are filtered to playoff game rows and written as `*_playoffs.parquet` processed files.
 
 #### Elo Ratings
 
-Games are replayed chronologically using the standard Elo formula:
+Games are replayed chronologically using a margin-of-victory-adjusted Elo formula:
 
 ```
 expected_home = 1 / (1 + 10 ^ ((R_away − (R_home + H)) / 400))
-R'            = R + K · (S − expected)
+mov_mult      = log1p(|margin|) / log1p(MOV_BASELINE)
+ot_factor     = 1 / (1 + num_ot × OT_DISCOUNT)
+R'            = R + K · mov_mult · ot_factor · (S − expected)
 ```
+
+`mov_mult` scales the update with the final point margin on a log scale — a win by `MOV_BASELINE` points (~8, the median NBA win margin) yields exactly 1.0×; a 30-point blowout ~1.56×; a 1-point win ~0.32×. `ot_factor` discounts overtime wins (1 OT → 0.67×, 2 OT → 0.50×).
 
 The home-court bonus `H` is **team-specific**, scaling with the home team's prior home win rate:
 
@@ -122,13 +134,14 @@ Values above 1.0 signal an acute workload spike above the chronic baseline. Both
 
 ### Stage 4 — Training (`src/models/train.py`)
 
-Rather than a static train/test split, training runs a **rolling day-by-day simulation** that mirrors real deployment:
+**Rolling simulation (default):** Loads the full-season processed feature snapshot from disk once upfront. Because the feature table uses `shift(1).expanding()`, each game row already carries only pre-game information — no per-iteration recompute is needed. For each unique game date `d`:
 
-1. For each unique game date `d` in the season:
-   - Recompute features in memory for all games up to and including `d`. Because rolling stats use `shift(1)`, game rows on date `d` carry only pre-`d` information — zero leakage.
-   - Train a fresh logistic regression on all completed games with `game_date < d`.
-   - Predict every game on date `d`.
-2. After the loop, train a final model on the full season and save it.
+1. Train a fresh logistic regression on all complete rows with `game_date < d`.
+2. Predict every game on date `d`.
+
+Dates with fewer than `min_train_games` (default 50) complete training rows are skipped (early-season cold start). After the loop, a final model is trained on the full season and saved.
+
+**Playoffs mode (`--playoffs`):** Trains a single logistic regression on the entire regular-season processed feature snapshot and saves it as `win_probability_logreg_playoffs.joblib`. Use after the regular season ends to prepare a model ready to predict playoff match-ups.
 
 **Model inputs** (home − away deltas):
 
@@ -141,17 +154,40 @@ Rather than a static train/test split, training runs a **rolling day-by-day simu
 | `fg_pct_delta` | Season FG% differential |
 | `fatigue_delta` | Team fatigue differential |
 | `acwr_delta` | ACWR differential |
+| `ast_delta` | Season average assists differential |
+| `reb_delta` | Season average rebounds differential |
+| `oreb_delta` | Season average offensive rebounds differential |
+| `blk_delta` | Season average blocks differential |
+| `stl_delta` | Season average steals differential |
+| `tov_delta` | Season average turnovers differential |
+| `pf_delta` | Season average personal fouls differential |
+| `fta_delta` | Season average free-throw attempts differential |
+| `ft_pct_delta` | Season FT% differential |
+| `plus_minus_delta` | Season average plus-minus differential |
 
 **Outputs:**
 
 | File | Description |
 |---|---|
-| `outputs/models/win_probability_logreg.joblib` | Final fitted pipeline (full season) |
+| `outputs/models/win_probability_logreg.joblib` | Final fitted pipeline (full regular season) |
+| `outputs/models/win_probability_logreg_playoffs.joblib` | Model trained on full regular season for playoff use (`--playoffs` mode) |
 | `outputs/models/rolling_predictions.parquet` | Each game predicted once using only prior-date data |
 
 ### Stage 5 — Evaluation (`src/models/evaluate.py`)
 
-Loads `rolling_predictions.parquet` and prints log-loss, Brier score, and accuracy. Saves a calibration curve and feature-coefficient chart to `outputs/figures/`.
+Loads `rolling_predictions.parquet` and the saved model, prints log-loss, Brier score, and accuracy, then saves nine diagnostic plots to `outputs/figures/`:
+
+| File | Description |
+|---|---|
+| `calibration_curve.png` | Predicted probability vs. actual win rate (scatter, colour-coded by bucket size) |
+| `feature_coefficients.png` | Model coefficients sorted by magnitude |
+| `elo_time_series.png` | Per-team Elo rating progression — small multiples (one panel per team) |
+| `elo_all_teams.png` | All 30 teams' Elo ratings overlaid on a single chart |
+| `rolling_accuracy.png` | Weekly accuracy bars + rolling-window accuracy line over the season |
+| `roc_curve.png` | ROC curve with AUC |
+| `confidence_histogram.png` | Distribution of predicted home-win probabilities by actual outcome |
+| `accuracy_by_confidence.png` | Accuracy binned by model confidence level (`max(p, 1−p)`) |
+| `team_accuracy.png` | Per-team prediction accuracy ranked bar chart |
 
 ---
 
@@ -161,7 +197,7 @@ The items below are planned for future versions, roughly in priority order.
 
 ### Performance optimisation of the rolling simulation
 
-The current fatigue computation (`_fatigue_decay_player`) is O(n²) per player. For a full 82-game season with ~450 active players, recomputing features from scratch on every game day makes the simulation slow. Planned fixes:
+The current fatigue computation (`_fatigue_decay_player`) is O(n²) per player. For a full 82-game season with ~450 active players the simulation can be slow. Planned fixes:
 
 - Incremental Elo updates — carry forward the previous day's ratings rather than replaying from game 1
 - Incremental fatigue computation — update rather than recompute from scratch
@@ -177,7 +213,6 @@ The current fatigue computation (`_fatigue_decay_player`) is O(n²) per player. 
 
 ### Advanced player features
 
-- **Plus-minus** — raw `+/-` is already in the box score; rolling `+/-` averages will be incorporated as a team and player feature
 - **Player experience** — season number, career games played, age; relevant for reliability and expected variance
 - **Player form and momentum** — short-window deviations from seasonal average for points and minutes; captures hot/cold streaks and whether a player is being leaned on more than usual
 - **Injury and rest context** — extended days-off tracking, whether a player is returning from a known absence, back-to-back fatigue flags
@@ -201,13 +236,20 @@ The current fatigue computation (`_fatigue_decay_player`) is O(n²) per player. 
 | Constant | File | Default | Purpose |
 |---|---|---|---|
 | `SEASON` | `src/utils/io.py` | `"2025"` | Active season; controls all data paths |
-| `API_DELAY` | `src/data/fetch_games.py` | `0.6` s | Delay between `nba_api` calls |
-| `FATIGUE_LAMBDA` | `src/data/features.py` | `0.2` | Decay rate for exponential fatigue model |
+| `API_DELAY` | `src/data/fetch_games.py` | `0.6` s | Delay between `nba_api` calls for small runs |
+| `BULK_API_DELAY` | `src/data/fetch_games.py` | `1.0` s | Delay used when fetching > 100 new games |
+| `CHECKPOINT_EVERY` | `src/data/fetch_games.py` | `100` | Games between intermediate box-score saves |
+| `COOLDOWN_EVERY` | `src/data/fetch_games.py` | `200` | Games between long cooldown pauses |
+| `COOLDOWN_SECONDS` | `src/data/fetch_games.py` | `30.0` s | Duration of each cooldown pause |
+| `FATIGUE_LAMBDA` | `src/data/features.py` | `0.2` | Decay rate for exponential fatigue model (day⁻¹) |
 | `ELO_INITIAL` | `src/data/features.py` | `1500.0` | Starting Elo for all teams |
-| `ELO_K` | `src/data/features.py` | `20.0` | Elo K-factor (update step size) |
+| `ELO_K` | `src/data/features.py` | `20.0` | Elo K-factor (base update step size) |
 | `ELO_HOME_ADV_BASE` | `src/data/features.py` | `100.0` | Elo home-court bonus for a .500 home record |
-| `ELO_HOME_ADV_SCALE` | `src/data/features.py` | `100.0` | Sensitivity to home win rate |
+| `ELO_HOME_ADV_SCALE` | `src/data/features.py` | `100.0` | Sensitivity of home-court bonus to home win rate |
 | `ELO_HOME_ADV_MIN` | `src/data/features.py` | `50.0` | Floor for worst home-record teams |
+| `ELO_MOV_BASELINE` | `src/data/features.py` | `8.0` | Point margin yielding a MOV multiplier of 1.0 (≈ median NBA win margin) |
+| `ELO_OT_DISCOUNT` | `src/data/features.py` | `0.5` | K reduction per OT period: `ot_factor = 1 / (1 + num_ot × discount)` |
+| `min_train_games` | `src/models/train.py` | `50` | Minimum training rows before rolling predictions begin |
 
 ---
 
@@ -235,8 +277,8 @@ nba-stats-model/
 │   │   └─ features.py              ← Stage 3: feature engineering
 │   │
 │   ├─ models/
-│   │   ├─ train.py                 ← Stage 4: rolling training simulation
-│   │   └─ evaluate.py             ← Stage 5: evaluation and plots
+│   │   ├─ train.py                 ← Stage 4: rolling training simulation + playoffs model
+│   │   └─ evaluate.py             ← Stage 5: evaluation and diagnostic plots
 │   │
 │   └─ utils/
 │       └─ io.py                    ← shared path constants and Parquet helpers
@@ -245,7 +287,7 @@ nba-stats-model/
 │
 └─ outputs/
     ├─ models/                      ← fitted model + rolling predictions
-    └─ figures/                     ← calibration curve, feature coefficients
+    └─ figures/                     ← calibration curve, feature coefficients, Elo plots, etc.
 ```
 
 ---
@@ -280,20 +322,32 @@ python src/data/features.py
 # Stage 4 — rolling day-by-day training simulation
 python src/models/train.py
 
-# Stage 5 — evaluate and plot
+# Stage 5 — evaluate and plot (9 diagnostic figures)
 python src/models/evaluate.py
 ```
 
-To fetch only the schedule without box scores:
+**Common flags:**
 
 ```bash
+# Fetch only the schedule (no box scores)
 python src/data/fetch_games.py --schedule-only
-```
 
-To pick up newly-played games without re-fetching the full history:
-
-```bash
+# Pick up newly-played games without re-fetching the full history
 python src/data/fetch_games.py --update
+
+# Override the API call delay (seconds)
+python src/data/fetch_games.py --api-delay 1.5
+
+# Full playoffs pipeline (run after completing the regular-season pipeline above)
+python src/data/fetch_games.py --playoffs [--update]
+python src/data/process.py --playoffs
+python src/data/features.py --playoffs
+
+# Train a playoffs-ready model on all regular-season data
+python src/models/train.py --playoffs
+
+# Raise the cold-start threshold (default 50)
+python src/models/train.py --min-train-games 100
 ```
 
 The active season is controlled by `SEASON` in `src/utils/io.py`. Changing it to a new year automatically reroutes all data paths.

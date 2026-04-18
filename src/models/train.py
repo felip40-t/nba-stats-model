@@ -1,43 +1,52 @@
 """
-train.py — Rolling day-by-day win-probability model.
+train.py — Win-probability model training.
 
-Simulation
-----------
-Rather than a static train/test split, this script replays the season
-chronologically.  For each game date ``d``:
+Two modes
+---------
+Rolling simulation (default)
+    Iterates over every game date ``d`` in the season.  For each date:
+    1. Trains on all complete game rows with ``game_date < d``.
+    2. Predicts all games on ``d``.
+    Features are computed once upfront from the processed snapshot on disk
+    (written by features.py) — no per-iteration recompute.  Because the
+    feature table uses ``shift(1).expanding()``, each game row already carries
+    only pre-game information, so slicing by date is sufficient and safe.
 
-1. Features are recomputed from interim data for all games up to and
-   including ``d``.  Because rolling stats use ``shift(1)``, the feature
-   row for a game on date ``d`` reflects only games strictly before ``d`` —
-   the correct entering-game state, with zero leakage.
-2. A fresh logistic regression is fitted on all completed games before ``d``.
-3. The model predicts win probability for every game on date ``d``.
-
-The resulting ``rolling_predictions.parquet`` covers the entire season —
-each game predicted exactly once using only information available before
-it was played.  This mirrors real deployment (predict today's games, update
-with results, retrain for tomorrow).
-
-At the end a final model is trained on the full season and saved alongside
-the predictions.
+Playoffs mode (``--playoffs``)
+    Trains a single model on the entire regular-season processed feature
+    snapshot and saves it as ``win_probability_logreg_playoffs.joblib``.
+    Use this after the regular season ends to prepare a model ready to
+    predict playoff match-ups.
 
 Feature set
 -----------
-elo_delta         home_elo_pre - away_elo_pre
-home_adv          home team's Elo home-court bonus
-win_rate_delta    home_season_win_rate - away_season_win_rate
-pts_delta         home_season_avg_pts - away_season_avg_pts
-fg_pct_delta      home_season_avg_fg_pct - away_season_avg_fg_pct
-fatigue_delta     home_team_fatigue - away_team_fatigue
-acwr_delta        home_team_acwr - away_team_acwr
+elo_delta           home_elo_pre - away_elo_pre
+home_adv            home team's Elo home-court bonus
+win_rate_delta      home_season_win_rate - away_season_win_rate
+pts_delta           home_season_avg_pts - away_season_avg_pts
+fg_pct_delta        home_season_avg_fg_pct - away_season_avg_fg_pct
+fatigue_delta       home_team_fatigue - away_team_fatigue
+acwr_delta          home_team_acwr - away_team_acwr
+ast_delta           home_season_avg_ast - away_season_avg_ast
+reb_delta           home_season_avg_reb - away_season_avg_reb
+oreb_delta          home_season_avg_oreb - away_season_avg_oreb
+blk_delta           home_season_avg_blk - away_season_avg_blk
+stl_delta           home_season_avg_stl - away_season_avg_stl
+tov_delta           home_season_avg_tov - away_season_avg_tov
+pf_delta            home_season_avg_pf - away_season_avg_pf
+fta_delta           home_season_avg_fta - away_season_avg_fta
+ft_pct_delta        home_season_avg_ft_pct - away_season_avg_ft_pct
+plus_minus_delta    home_season_avg_plus_minus - away_season_avg_plus_minus
 
 Run from the project root::
 
-    python src/models/train.py
+    python src/models/train.py                  # rolling simulation
+    python src/models/train.py --playoffs        # full-season model for playoffs
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -52,8 +61,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data.features import compute_features_from_data  # noqa: E402
-from src.utils.io import MODELS_DIR, read_interim, read_schedule  # noqa: E402
+from src.utils.io import MODELS_DIR, read_processed, read_schedule  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -63,6 +71,16 @@ _TEAM_FEATURE_COLS = [
     "season_win_rate",
     "season_avg_pts",
     "season_avg_fg_pct",
+    "season_avg_ast",
+    "season_avg_reb",
+    "season_avg_oreb",
+    "season_avg_blk",
+    "season_avg_stl",
+    "season_avg_tov",
+    "season_avg_pf",
+    "season_avg_fta",
+    "season_avg_ft_pct",
+    "season_avg_plus_minus",
     "team_fatigue",
     "team_acwr",
 ]
@@ -75,6 +93,16 @@ MODEL_FEATURES = [
     "fg_pct_delta",
     "fatigue_delta",
     "acwr_delta",
+    "ast_delta",
+    "reb_delta",
+    "oreb_delta",
+    "blk_delta",
+    "stl_delta",
+    "tov_delta",
+    "pf_delta",
+    "fta_delta",
+    "ft_pct_delta",
+    "plus_minus_delta",
 ]
 
 
@@ -129,6 +157,16 @@ def compute_deltas(games: pd.DataFrame) -> pd.DataFrame:
     games["fg_pct_delta"] = games["home_season_avg_fg_pct"] - games["away_season_avg_fg_pct"]
     games["fatigue_delta"] = games["home_team_fatigue"] - games["away_team_fatigue"]
     games["acwr_delta"] = games["home_team_acwr"] - games["away_team_acwr"]
+    games["ast_delta"] = games["home_season_avg_ast"] - games["away_season_avg_ast"]
+    games["reb_delta"] = games["home_season_avg_reb"] - games["away_season_avg_reb"]
+    games["oreb_delta"] = games["home_season_avg_oreb"] - games["away_season_avg_oreb"]
+    games["blk_delta"] = games["home_season_avg_blk"] - games["away_season_avg_blk"]
+    games["stl_delta"] = games["home_season_avg_stl"] - games["away_season_avg_stl"]
+    games["tov_delta"] = games["home_season_avg_tov"] - games["away_season_avg_tov"]
+    games["pf_delta"] = games["home_season_avg_pf"] - games["away_season_avg_pf"]
+    games["fta_delta"] = games["home_season_avg_fta"] - games["away_season_avg_fta"]
+    games["ft_pct_delta"] = games["home_season_avg_ft_pct"] - games["away_season_avg_ft_pct"]
+    games["plus_minus_delta"] = games["home_season_avg_plus_minus"] - games["away_season_avg_plus_minus"]
     return games
 
 
@@ -164,45 +202,43 @@ def train_model(train: pd.DataFrame) -> Pipeline:
 # ---------------------------------------------------------------------------
 
 def build_rolling_predictions(
-    game_log: pd.DataFrame,
-    player_game_log: pd.DataFrame,
-    team_advanced: pd.DataFrame,
-    schedule: pd.DataFrame,
+    games: pd.DataFrame,
     min_train_games: int = 50,
-) -> tuple[pd.DataFrame, Pipeline]:
-    """Simulate the model predicting each game day using only prior data.
+) -> pd.DataFrame:
+    """Simulate the model predicting each game using only prior data.
 
-    Iterates over every unique game date ``d`` in the season.  For each date:
-    - Computes features for all games up to and including ``d`` (shift-1
-      ensures game rows on ``d`` carry only pre-``d`` information).
-    - Trains on all complete game rows with ``game_date < d``.
+    Receives the full pre-built, pre-filtered game table (features already
+    computed for the whole season upfront).  For each date ``d``:
+
+    - Trains on all complete rows with ``game_date < d``.
     - Predicts all games on ``d``.
+
+    No feature recomputation happens inside this loop — the ``shift(1)``
+    encoding in the feature table guarantees that each row already carries
+    only pre-game information.
 
     Skips dates where the training set has fewer than ``min_train_games``
     complete rows (early-season cold start).
 
+    Parameters
+    ----------
+    games:
+        Output of ``drop_missing(compute_deltas(build_game_rows(...)))``.
+        One row per played game with all MODEL_FEATURES and ``home_win``.
+    min_train_games:
+        Minimum training rows required before predictions begin.
+
     Returns
     -------
-    rolling_predictions : pd.DataFrame
+    pd.DataFrame
         One row per predicted game with columns ``game_id``, ``game_date``,
         ``home_team_id``, ``away_team_id``, ``home_win``,
         ``predicted_proba``, ``predicted_label``.
-    final_model : Pipeline
-        Model retrained on the full season's data.
     """
-    game_dates = sorted(pd.to_datetime(game_log["game_date"]).dt.date.unique())
+    game_dates = sorted(games["game_date"].dt.date.unique())
     all_predictions: list[pd.DataFrame] = []
 
     for i, date in enumerate(game_dates):
-        cutoff = pd.Timestamp(date)
-
-        result = compute_features_from_data(
-            game_log, player_game_log, team_advanced, cutoff_date=cutoff
-        )
-        games = build_game_rows(result["team_features"], schedule)
-        games = compute_deltas(games)
-        games = drop_missing(games)
-
         train = games[games["game_date"].dt.date < date]
         today = games[games["game_date"].dt.date == date]
 
@@ -223,51 +259,95 @@ def build_rolling_predictions(
         log.info("  [%d/%d] %s : trained on %d games, predicted %d",
                  i + 1, len(game_dates), date, len(train), len(today))
 
-    # Final model trained on the full season.
-    log.info("Training final model on full season ...")
-    full = compute_features_from_data(game_log, player_game_log, team_advanced)
-    all_games = build_game_rows(full["team_features"], schedule)
-    all_games = compute_deltas(all_games)
-    all_games = drop_missing(all_games)
-    final_model = train_model(all_games)
-    log.info("  final training set : %d games", len(all_games))
-
-    combined = (
+    return (
         pd.concat(all_predictions, ignore_index=True)
         if all_predictions
         else pd.DataFrame()
     )
-    return combined, final_model
 
 
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    log.info("Loading interim data ...")
-    game_log = read_interim("game_log.parquet")
-    player_game_log = read_interim("player_game_log.parquet")
-    team_advanced = read_interim("team_advanced.parquet")
-    schedule = read_schedule()
-    log.info("  game_log : %d rows", len(game_log))
-    log.info("  schedule : %d games", len(schedule))
-
-    log.info("Starting rolling day-by-day simulation ...")
-    rolling_preds, final_model = build_rolling_predictions(
-        game_log, player_game_log, team_advanced, schedule
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Train the NBA win-probability model.")
+    p.add_argument(
+        "--playoffs",
+        action="store_true",
+        help=(
+            "Train on all regular-season data at once and save a playoffs-ready "
+            "model (win_probability_logreg_playoffs.joblib).  Skips the rolling "
+            "simulation."
+        ),
     )
-    log.info("  predictions collected : %d", len(rolling_preds))
+    p.add_argument(
+        "--min-train-games",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Minimum training rows before rolling predictions begin (default: 50).",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+
+    # ------------------------------------------------------------------
+    # Load processed features (written by features.py).
+    # ------------------------------------------------------------------
+    log.info("Loading processed team features ...")
+    team_features = read_processed("team_features.parquet")
+    schedule = read_schedule()
+    log.info("  team_features : %d rows", len(team_features))
+    log.info("  schedule      : %d games", len(schedule))
+
+    # ------------------------------------------------------------------
+    # Build the full-season game table once — shared by both modes.
+    # build_game_rows pivots team features into one row per game;
+    # compute_deltas adds the home-minus-away delta columns;
+    # drop_missing removes rows where any model feature is NaN (early
+    # season games before the cold-start threshold has been reached).
+    # ------------------------------------------------------------------
+    log.info("Building game rows and computing deltas ...")
+    games = build_game_rows(team_features, schedule)
+    games = compute_deltas(games)
+    games = drop_missing(games)
+    log.info("  complete game rows : %d", len(games))
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    model_path = MODELS_DIR / "win_probability_logreg.joblib"
-    joblib.dump(final_model, model_path)
-    log.info("Model saved → %s", model_path.relative_to(PROJECT_ROOT))
+    if args.playoffs:
+        # ------------------------------------------------------------------
+        # Playoffs mode: train one model on all regular-season data.
+        # ------------------------------------------------------------------
+        log.info("Playoffs mode: training on full regular-season dataset (%d games) ...", len(games))
+        model = train_model(games)
 
-    pred_path = MODELS_DIR / "rolling_predictions.parquet"
-    rolling_preds.to_parquet(pred_path, index=False)
-    log.info("Rolling predictions saved → %s", pred_path.relative_to(PROJECT_ROOT))
+        model_path = MODELS_DIR / "win_probability_logreg_playoffs.joblib"
+        joblib.dump(model, model_path)
+        log.info("Playoffs model saved → %s", model_path.relative_to(PROJECT_ROOT))
+
+    else:
+        # ------------------------------------------------------------------
+        # Rolling mode: predict each game using only prior-date data,
+        # then train a final model on the complete season.
+        # ------------------------------------------------------------------
+        log.info("Starting rolling day-by-day simulation ...")
+        rolling_preds = build_rolling_predictions(games, min_train_games=args.min_train_games)
+        log.info("  predictions collected : %d", len(rolling_preds))
+
+        pred_path = MODELS_DIR / "rolling_predictions.parquet"
+        rolling_preds.to_parquet(pred_path, index=False)
+        log.info("Rolling predictions saved → %s", pred_path.relative_to(PROJECT_ROOT))
+
+        log.info("Training final model on full season (%d games) ...", len(games))
+        final_model = train_model(games)
+
+        model_path = MODELS_DIR / "win_probability_logreg.joblib"
+        joblib.dump(final_model, model_path)
+        log.info("Model saved → %s", model_path.relative_to(PROJECT_ROOT))
 
     print("\nDone.")
 

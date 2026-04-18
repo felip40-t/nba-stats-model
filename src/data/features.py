@@ -33,6 +33,7 @@ only (current game is never included):
 Run from the project root::
 
     python src/data/features.py
+    python src/data/features.py --playoffs
 """
 
 from __future__ import annotations
@@ -59,6 +60,12 @@ ELO_K: float = 20.0
 ELO_HOME_ADV_BASE: float = 100.0   # advantage for a team with .500 home record
 ELO_HOME_ADV_SCALE: float = 100.0  # sensitivity to home win rate
 ELO_HOME_ADV_MIN: float = 50.0     # floor: worst home team still gets this bonus
+# Margin-of-victory multiplier: effective K = K × log1p(|margin|)/log1p(MOV_BASELINE) × ot_factor
+# MOV_BASELINE is the point margin that yields a multiplier of exactly 1.0 (≈ median NBA win margin).
+ELO_MOV_BASELINE: float = 8.0
+# OT discount: ot_factor = 1 / (1 + num_ot × OT_DISCOUNT)
+# 0 OT → 1.0×  |  1 OT → 0.67×  |  2 OT → 0.50×  |  3 OT → 0.40×
+ELO_OT_DISCOUNT: float = 0.5
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
@@ -78,24 +85,31 @@ def compute_elo_ratings(
     home_adv_base: float = ELO_HOME_ADV_BASE,
     home_adv_scale: float = ELO_HOME_ADV_SCALE,
     home_adv_min: float = ELO_HOME_ADV_MIN,
+    mov_baseline: float = ELO_MOV_BASELINE,
+    ot_discount: float = ELO_OT_DISCOUNT,
 ) -> pd.DataFrame:
     """Compute pre- and post-game Elo ratings for every team-game row.
 
     Games are replayed in chronological order.  Each team starts at
-    ``initial`` and its rating is updated after every game using the
-    classic Elo formula::
+    ``initial`` and its rating is updated after every game using a
+    margin-of-victory-adjusted Elo formula::
 
         expected_home = 1 / (1 + 10 ** ((R_away − (R_home + H)) / 400))
-        R'            = R + K · (S − expected)
+        mov_mult      = log1p(|margin|) / log1p(mov_baseline)
+        ot_factor     = 1 / (1 + num_ot × ot_discount)
+        R'            = R + K · mov_mult · ot_factor · (S − expected)
 
-    where ``S`` is 1 for a win, 0 for a loss.  The home-court bonus ``H``
-    is *team-specific*: it scales with the home team's season-to-date home
-    win rate (from prior home games only — no leakage)::
+    where ``S`` is 1 for a win, 0 for a loss.  ``mov_mult`` scales the update
+    with the final point margin on a log scale — a win by ``mov_baseline``
+    points gives exactly 1.0 (calibrated to the typical NBA win margin of ~8
+    pts), a blowout win by 30 gives ~1.56×, and a 1-point win gives ~0.32×.
+    ``ot_factor`` discounts overtime wins: a 1-point win in 2 OTs carries less
+    Elo weight than the same margin in regulation.
+
+    The home-court bonus ``H`` is *team-specific*::
 
         H = max(home_adv_min, home_adv_base + (home_win_rate − 0.5) × home_adv_scale)
 
-    A team with a .500 home record gets the baseline advantage; better home
-    teams earn a higher bonus, worse home teams are floored at ``home_adv_min``.
     Teams with no prior home games start at the .500 prior (``home_adv_base``).
 
     ``elo_pre`` is the rating carried *into* the current game (safe as a
@@ -105,11 +119,15 @@ def compute_elo_ratings(
     ----------
     game_log:
         Team game-log with columns ``game_id``, ``game_date``, ``team_id``,
-        ``is_home``, ``win``.  Expected to contain two rows per game.
+        ``is_home``, ``win``, ``plus_minus``, ``num_ot``.  Two rows per game.
     initial, k:
-        Starting Elo and update step size.
+        Starting Elo and base update step size.
     home_adv_base, home_adv_scale, home_adv_min:
         Parameters controlling the team-specific home-court bonus.
+    mov_baseline:
+        Point margin that yields a MOV multiplier of exactly 1.0.
+    ot_discount:
+        Fractional K reduction per overtime period.
 
     Returns
     -------
@@ -117,13 +135,16 @@ def compute_elo_ratings(
         One row per team per game with columns ``game_id``, ``team_id``,
         ``elo_pre``, ``elo_post``, ``home_adv``.
     """
-    cols = ["game_id", "game_date", "team_id", "is_home", "win"]
+    want_cols = ["game_id", "game_date", "team_id", "is_home", "win", "plus_minus", "num_ot"]
+    cols = [c for c in want_cols if c in game_log.columns]
     games = game_log[cols].sort_values(["game_date", "game_id"]).reset_index(drop=True)
 
     ratings: dict[int, float] = {}
     home_games: dict[int, int] = {}   # home games played before current game
     home_wins: dict[int, int] = {}    # home wins before current game
     records: list[dict] = []
+
+    log_baseline = np.log1p(mov_baseline)
 
     # groupby with sort=False preserves the chronological order established above.
     for game_id, group in games.groupby("game_id", sort=False):
@@ -147,8 +168,18 @@ def compute_elo_ratings(
         exp_h = 1.0 / (1.0 + 10.0 ** ((r_a - (r_h + home_adv)) / 400.0))
         s_h = 1.0 if bool(home["win"]) else 0.0
 
-        new_r_h = r_h + k * (s_h - exp_h)
-        new_r_a = r_a + k * ((1.0 - s_h) - (1.0 - exp_h))
+        # Margin-of-victory multiplier (log-scaled, normalised to 1.0 at mov_baseline).
+        abs_margin = abs(int(home["plus_minus"])) if "plus_minus" in home.index else 0
+        mov_mult = np.log1p(abs_margin) / log_baseline if log_baseline > 0 else 1.0
+
+        # Overtime discount: each extra period reduces the effective K.
+        n_ot = int(home["num_ot"]) if ("num_ot" in home.index and pd.notna(home["num_ot"])) else 0
+        ot_factor = 1.0 / (1.0 + n_ot * ot_discount)
+
+        eff_k = k * mov_mult * ot_factor
+
+        new_r_h = r_h + eff_k * (s_h - exp_h)
+        new_r_a = r_a + eff_k * ((1.0 - s_h) - (1.0 - exp_h))
 
         game_date = home["game_date"]
         records.append({"game_id": game_id, "game_date": game_date, "team_id": h_id,
@@ -202,7 +233,7 @@ def build_team_features(
 
     # Columns to roll — box-score stats + efficiency metrics
     avg_cols = [
-        "pts", "reb", "ast", "stl", "blk", "tov",
+        "pts", "reb", "oreb", "ast", "stl", "blk", "tov", "pf", "fta",
         "fg_pct", "fg3_pct", "ft_pct", "plus_minus",
         "true_shooting_pct", "three_point_rate", "free_throw_rate", "oreb_pct_proxy",
     ]
@@ -230,9 +261,10 @@ def build_team_features(
     # Merge the team's own pre/post Elo, then self-join on game_id to attach
     # the opponent's pre-game Elo (useful for win-probability modelling).
     elo = compute_elo_ratings(game_log)
-    df = df.merge(elo, on=["game_id", "team_id"], how="left")
+    elo_merge = elo.drop(columns=["game_date"], errors="ignore")
+    df = df.merge(elo_merge, on=["game_id", "team_id"], how="left")
 
-    opp_elo = elo.rename(
+    opp_elo = elo_merge.rename(
         columns={"team_id": "opp_team_id", "elo_pre": "opp_elo_pre"}
     )[["game_id", "opp_team_id", "opp_elo_pre"]]
     df = df.merge(opp_elo, on="game_id", how="left")
@@ -491,7 +523,11 @@ def _print_table(title: str, df: pd.DataFrame, max_cols: int = 12) -> None:
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
-def run_pipeline(cutoff_date=None, verbose: bool = True) -> dict[str, pd.DataFrame]:
+def run_pipeline(
+    cutoff_date=None,
+    playoffs: bool = False,
+    verbose: bool = True,
+) -> dict[str, pd.DataFrame]:
     """Execute the feature-engineering pipeline and optionally write processed tables.
 
     Parameters
@@ -501,6 +537,13 @@ def run_pipeline(cutoff_date=None, verbose: bool = True) -> dict[str, pd.DataFra
         cutoff is given, nothing is written to disk (in-memory only).  Call
         without a cutoff at the end of the season to save the final snapshot
         and the Elo time series.
+    playoffs:
+        If True, load playoff interim files (``*_playoffs.parquet``) and
+        concatenate them with the regular-season tables before computing
+        features.  Regular-season data is always included so that Elo ratings
+        carry over and rolling averages are not cold-started at game 1 of the
+        playoffs.  Only playoff game rows are kept in the outputs and written
+        to disk (``*_playoffs.parquet`` processed files).
     verbose:
         If True, print progress, table shapes, and previews.
 
@@ -515,27 +558,54 @@ def run_pipeline(cutoff_date=None, verbose: bool = True) -> dict[str, pd.DataFra
     player_game_log = read_interim("player_game_log.parquet")
     team_advanced = read_interim("team_advanced.parquet")
 
+    playoff_game_ids: set | None = None
+
+    if playoffs:
+        game_log_po = read_interim("game_log_playoffs.parquet")
+        player_game_log_po = read_interim("player_game_log_playoffs.parquet")
+        team_advanced_po = read_interim("team_advanced_playoffs.parquet")
+
+        playoff_game_ids = set(game_log_po["game_id"])
+
+        # Combine: regular-season rows provide rolling history; playoff rows
+        # are the target.  Game IDs are disjoint so no dedup is needed.
+        game_log = pd.concat([game_log, game_log_po], ignore_index=True)
+        player_game_log = pd.concat([player_game_log, player_game_log_po], ignore_index=True)
+        team_advanced = pd.concat([team_advanced, team_advanced_po], ignore_index=True)
+
     if verbose:
-        print(f"  game_log         : {game_log.shape[0]} rows, {game_log.shape[1]} cols")
+        label = "playoffs (reg + playoff combined)" if playoffs else "regular season"
+        print(f"  game_log         : {game_log.shape[0]} rows, {game_log.shape[1]} cols  [{label}]")
         print(f"  player_game_log  : {player_game_log.shape[0]} rows, {player_game_log.shape[1]} cols")
         print(f"  team_advanced    : {team_advanced.shape[0]} rows, {team_advanced.shape[1]} cols")
 
     outputs = compute_features_from_data(game_log, player_game_log, team_advanced, cutoff_date)
 
+    if playoffs and playoff_game_ids is not None:
+        outputs["team_features"] = (
+            outputs["team_features"][outputs["team_features"]["game_id"].isin(playoff_game_ids)]
+            .reset_index(drop=True)
+        )
+        outputs["player_features"] = (
+            outputs["player_features"][outputs["player_features"]["game_id"].isin(playoff_game_ids)]
+            .reset_index(drop=True)
+        )
+
     if cutoff_date is None:
+        suffix = "_playoffs" if playoffs else ""
         if verbose:
             print("\nSaving to data/processed/ ...")
 
         for name, df in outputs.items():
-            dest = write_processed(df, f"{name}.parquet")
+            dest = write_processed(df, f"{name}{suffix}.parquet")
             if verbose:
                 print(f"  -> {dest.relative_to(PROJECT_ROOT)}")
 
-        # Elo time series: one row per team per game for the full season.
+        # Elo time series: one row per team per game.
         elo_ts = outputs["team_features"][
             ["game_id", "game_date", "team_id", "elo_pre", "elo_post"]
         ].copy()
-        dest = write_processed(elo_ts, "elo_ratings.parquet")
+        dest = write_processed(elo_ts, f"elo_ratings{suffix}.parquet")
         if verbose:
             print(f"  -> {dest.relative_to(PROJECT_ROOT)}")
 
@@ -550,5 +620,35 @@ def run_pipeline(cutoff_date=None, verbose: bool = True) -> dict[str, pd.DataFra
 # Entry point
 # ---------------------------------------------------------------------------
 
+def _parse_args(argv=None):
+    import argparse
+    p = argparse.ArgumentParser(
+        description="Feature engineering pipeline for NBA stats model.",
+    )
+    p.add_argument(
+        "--cutoff",
+        metavar="YYYY-MM-DD",
+        default=None,
+        help=(
+            "Only use games on or before this date.  Features for games on the "
+            "cutoff date are computed from strictly prior games (shift-1), so "
+            "the result is the correct entering-game state.  When omitted the "
+            "full season is processed and results are written to disk."
+        ),
+    )
+    p.add_argument(
+        "--playoffs",
+        action="store_true",
+        help=(
+            "Process playoff interim files (*_playoffs.parquet).  Regular-season "
+            "data is always included as rolling history so Elo and averages carry "
+            "over.  Outputs are filtered to playoff games and written to "
+            "*_playoffs.parquet processed files."
+        ),
+    )
+    return p.parse_args(argv)
+
+
 if __name__ == "__main__":
-    run_pipeline(verbose=True)
+    args = _parse_args()
+    run_pipeline(cutoff_date=args.cutoff, playoffs=args.playoffs, verbose=True)
