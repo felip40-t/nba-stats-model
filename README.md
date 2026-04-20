@@ -14,7 +14,7 @@ The target milestone is **working software ready for the 2026 NBA playoffs**.
 
 ## Current Status
 
-**Version 2.2.0** — Added prior-season Elo carry-over (end-of-season ratings regressed 50% toward 1500 before the new season begins), an Elo hyperparameter grid search script (`elo_grid_search.py`), and a feature-analysis toolkit (`tests/feature_tests.py`) covering L1 sweep, permutation importance, ablation, and VIF. The active model now trains on 5 core features while the full delta feature set (50+ columns) remains computed and available for experimentation. See [Roadmap](#roadmap) for what is still to be done.
+**Version 2.1.0** — Added prior-season Elo carry-over (end-of-season ratings regressed 50% toward 1500 before the new season begins), an Elo hyperparameter grid search script (`elo_grid_search.py`), and a feature-analysis toolkit (`tests/feature_tests.py`) covering L1 sweep, permutation importance, ablation, and VIF. The active model now trains on 5 core features while the full delta feature set (50+ columns) remains computed and available for experimentation. See [Roadmap](#roadmap) for what is still to be done.
 
 | Stage | Status |
 |---|---|
