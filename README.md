@@ -14,7 +14,7 @@ The target milestone is **working software ready for the 2026 NBA playoffs**.
 
 ## Current Status
 
-**Version 2.1.0** — Added prior-season Elo carry-over (end-of-season ratings regressed 50% toward 1500 before the new season begins), an Elo hyperparameter grid search script (`elo_grid_search.py`), and a feature-analysis toolkit (`tests/feature_tests.py`) covering L1 sweep, permutation importance, ablation, and VIF. The active model now trains on 5 core features while the full delta feature set (50+ columns) remains computed and available for experimentation. See [Roadmap](#roadmap) for what is still to be done.
+**Version 2.2.0** — Added XGBoost as a second model alongside logistic regression. Both models share the same data pipeline and rolling simulation. `train.py` and `evaluate.py` accept a `--model {logreg,xgboost}` flag; outputs are organised by model name. XGBoost is set up with a `XGBOOST_DEFAULT_PARAMS` constant ready for hyperparameter tuning. See [Roadmap](#roadmap) for what is still to be done.
 
 | Stage | Status |
 |---|---|
@@ -35,6 +35,8 @@ The target milestone is **working software ready for the 2026 NBA playoffs**.
 | Model evaluation (metrics + 9 diagnostic plots) | Done |
 | Feature importance + collinearity analysis tools | Done |
 | Test suite (pytest smoke tests for process, features, train) | Done |
+| XGBoost model (alongside logistic regression) | Done |
+| XGBoost hyperparameter tuning | Pending |
 
 ---
 
@@ -147,12 +149,19 @@ Values above 1.0 signal an acute workload spike above the chronic baseline. Both
 
 **Rolling simulation (default):** Loads the full-season processed feature snapshot from disk once upfront. Because the feature table uses `shift(1).expanding()`, each game row already carries only pre-game information — no per-iteration recompute is needed. For each unique game date `d`:
 
-1. Train a fresh logistic regression on all complete rows with `game_date < d`.
+1. Train a fresh model on all complete rows with `game_date < d`.
 2. Predict every game on date `d`.
 
 Dates with fewer than `min_train_games` (default 50) complete training rows are skipped (early-season cold start). After the loop, a final model is trained on the full season and saved.
 
-**Playoffs mode (`--playoffs`):** Trains a single logistic regression on the entire regular-season processed feature snapshot and saves it as `win_probability_logreg_playoffs.joblib`. Use after the regular season ends to prepare a model ready to predict playoff match-ups.
+**Playoffs mode (`--playoffs`):** Trains a single model on the entire regular-season processed feature snapshot. Use after the regular season ends to prepare a model ready to predict playoff match-ups.
+
+**Model selection (`--model`):** Two models are available and share the same pipeline and feature set:
+
+| Model | Flag | Description |
+|---|---|---|
+| Logistic regression | `--model logreg` (default) | `StandardScaler + LogisticRegression` sklearn pipeline |
+| XGBoost | `--model xgboost` | `XGBClassifier` with defaults in `XGBOOST_DEFAULT_PARAMS`; ready for hyperparameter tuning |
 
 **Active model inputs** (`MODEL_FEATURES` — home − away deltas):
 
@@ -166,29 +175,37 @@ Dates with fewer than `min_train_games` (default 50) complete training rows are 
 
 `compute_deltas()` computes the full set of 50+ home-minus-away delta columns (season-to-date averages, efficiency metrics, defensive metrics, recent form, win streak, last-10 rolling averages) — these are available in the game table for experimentation but are not currently included in `MODEL_FEATURES`. Use `tests/model_tests.py` to analyse which features are most informative.
 
-**Outputs:**
+**Outputs** (model name is substituted for `{model}`):
 
 | File | Description |
 |---|---|
-| `outputs/models/win_probability_logreg.joblib` | Final fitted pipeline (full regular season) |
-| `outputs/models/win_probability_logreg_playoffs.joblib` | Model trained on full regular season for playoff use (`--playoffs` mode) |
-| `outputs/models/rolling_predictions.parquet` | Each game predicted once using only prior-date data |
+| `outputs/models/win_probability_{model}.joblib` | Final fitted model (full regular season) |
+| `outputs/models/win_probability_{model}_playoffs.joblib` | Model trained on full regular season for playoff use (`--playoffs` mode) |
+| `outputs/models/rolling_predictions_{model}.parquet` | Each game predicted once using only prior-date data |
 
 ### Stage 5 — Evaluation (`src/models/evaluate.py`)
 
-Loads `rolling_predictions.parquet` and the saved model, prints log-loss, Brier score, and accuracy, then saves nine diagnostic plots to `outputs/figures/`:
+Loads the rolling predictions and saved model for the selected `--model`, prints log-loss, Brier score, and accuracy, then saves diagnostic plots. Model-specific plots go to `outputs/figures/{model}/`; Elo plots are model-agnostic and stay at `outputs/figures/`.
+
+**Model-specific plots** (`outputs/figures/logreg/` or `outputs/figures/xgboost/`):
 
 | File | Description |
 |---|---|
 | `calibration_curve.png` | Predicted probability vs. actual win rate (scatter, colour-coded by bucket size) |
-| `feature_coefficients.png` | Model coefficients sorted by magnitude |
-| `elo_time_series.png` | Per-team Elo rating progression — small multiples (one panel per team) |
-| `elo_all_teams.png` | All 30 teams' Elo ratings overlaid on a single chart |
+| `feature_coefficients.png` | Logistic regression coefficients sorted by magnitude (logreg only) |
+| `feature_importance.png` | XGBoost feature importances by gain (xgboost only) |
 | `rolling_accuracy.png` | Weekly accuracy bars + rolling-window accuracy line over the season |
 | `roc_curve.png` | ROC curve with AUC |
 | `confidence_histogram.png` | Distribution of predicted home-win probabilities by actual outcome |
 | `accuracy_by_confidence.png` | Accuracy binned by model confidence level (`max(p, 1−p)`) |
 | `team_accuracy.png` | Per-team prediction accuracy ranked bar chart |
+
+**Model-agnostic plots** (`outputs/figures/`):
+
+| File | Description |
+|---|---|
+| `elo_time_series.png` | Per-team Elo rating progression — small multiples (one panel per team) |
+| `elo_all_teams.png` | All 30 teams' Elo ratings overlaid on a single chart |
 
 ---
 
@@ -213,7 +230,7 @@ The items below are planned for future versions, roughly in priority order.
 
 - **Re-expand MODEL_FEATURES** — use `tests/feature_tests.py` (L1 sweep, permutation importance, ablation, VIF) to identify which of the 50+ computed deltas contribute signal, then add the survivors back to `MODEL_FEATURES`
 - **Calibration post-processing** — Platt scaling or isotonic regression on rolling predictions
-- **Gradient boosting** — XGBoost / LightGBM as a second model alongside logistic regression
+- **XGBoost hyperparameter tuning** — grid or random search over `XGBOOST_DEFAULT_PARAMS` (n_estimators, max_depth, learning_rate, subsample, colsample_bytree, etc.)
 
 ### Player features
 
@@ -291,8 +308,11 @@ nba-stats-model/
 │   └─ model_tests.py               ← script: run feature_tests against the trained model on disk
 │
 └─ outputs/
-    ├─ models/                      ← fitted model + rolling predictions
-    └─ figures/                     ← calibration curve, feature coefficients, Elo plots, etc.
+    ├─ models/                      ← fitted models + rolling predictions (named by model type)
+    └─ figures/
+        ├─ logreg/                  ← logreg-specific diagnostic plots
+        ├─ xgboost/                 ← xgboost-specific diagnostic plots
+        └─ (root)                   ← model-agnostic Elo plots
 ```
 
 ---
@@ -324,11 +344,15 @@ python src/data/process.py
 # Stage 3 — feature engineering → processed tables + elo_ratings.parquet
 python src/data/features.py
 
-# Stage 4 — rolling day-by-day training simulation
+# Stage 4 — rolling day-by-day training simulation (logistic regression)
 python src/models/train.py
+# or with XGBoost:
+python src/models/train.py --model xgboost
 
-# Stage 5 — evaluate and plot (9 diagnostic figures)
+# Stage 5 — evaluate and plot
 python src/models/evaluate.py
+# or with XGBoost:
+python src/models/evaluate.py --model xgboost
 ```
 
 **Optional — Elo hyperparameter grid search:**
@@ -358,6 +382,7 @@ python src/data/features.py --playoffs
 
 # Train a playoffs-ready model on all regular-season data
 python src/models/train.py --playoffs
+python src/models/train.py --model xgboost --playoffs
 
 # Raise the cold-start threshold (default 50)
 python src/models/train.py --min-train-games 100
@@ -383,6 +408,7 @@ python -m pytest tests/
 | [matplotlib](https://matplotlib.org/) | Visualisation |
 | [nba_api](https://github.com/swar/nba_api) | NBA Stats API client |
 | [pyarrow](https://arrow.apache.org/docs/python/) | Apache Parquet I/O |
+| [xgboost](https://xgboost.readthedocs.io/) | Gradient boosting model |
 | [joblib](https://joblib.readthedocs.io/) | Model serialisation |
 
 ---
