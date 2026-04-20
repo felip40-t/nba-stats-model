@@ -62,9 +62,9 @@ from pathlib import Path
 
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+_HERE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_HERE_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_HERE_PROJECT_ROOT))
 
 from nba_api.stats.endpoints import BoxScoreTraditionalV3, LeagueGameLog, ScheduleLeagueV2  # noqa: E402
 
@@ -172,13 +172,26 @@ def _raw_filename(base: str, playoffs: bool) -> str:
 
 
 def _existing_game_ids(boxscore_path: Path) -> set[str]:
-    """Return the set of ``gameId`` values already present on disk."""
+    """Return the set of ``gameId`` values already present on disk.
+
+    Reads only the ``gameId`` column via pyarrow so we don't pay to
+    materialise the full box-score DataFrame just to check membership.
+    """
     if not boxscore_path.exists():
         return set()
-    df = read_parquet(boxscore_path)
-    if "gameId" in df.columns:
-        return set(df["gameId"].astype(str).unique())
-    return set()
+    try:
+        import pyarrow.parquet as pq
+
+        schema = pq.read_schema(boxscore_path)
+        if "gameId" not in schema.names:
+            return set()
+        table = pq.read_table(boxscore_path, columns=["gameId"])
+        return {str(v) for v in table.column("gameId").to_pylist() if v is not None}
+    except Exception:  # fall back to full read on unexpected schema/engine issues
+        df = read_parquet(boxscore_path)
+        if "gameId" in df.columns:
+            return set(df["gameId"].astype(str).unique())
+        return set()
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +214,7 @@ def run(
     season: str,
     playoffs: bool = False,
     update: bool = False,
+    refresh_schedule: bool = False,
     api_delay: float | None = None,
 ) -> None:
     """Execute a fetch for the given season / mode.
@@ -222,9 +236,11 @@ def run(
         (or :data:`BULK_API_DELAY` when fetching >100 new games).
     """
     schedule_path = RAW_DIR / "schedule.parquet"
-    if schedule_path.exists():
+    if schedule_path.exists() and not refresh_schedule:
         print(f"Schedule already on disk ({schedule_path.relative_to(PROJECT_ROOT)}) — skipping fetch.")
     else:
+        if refresh_schedule and schedule_path.exists():
+            print("Refreshing schedule (overwriting on-disk copy) ...")
         run_schedule_only(season)
     print()
 
@@ -374,6 +390,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Incremental: only fetch games not already in the raw box-score file.",
     )
     p.add_argument(
+        "--refresh-schedule",
+        action="store_true",
+        help="Re-fetch the schedule even if one is already on disk (e.g. to pick up makeup games).",
+    )
+    p.add_argument(
         "--api-delay",
         type=float,
         default=None,
@@ -393,6 +414,7 @@ def main(argv: list[str] | None = None) -> None:
         season=SEASON,
         playoffs=args.playoffs,
         update=args.update,
+        refresh_schedule=args.refresh_schedule,
         api_delay=args.api_delay,
     )
 

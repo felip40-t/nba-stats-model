@@ -38,11 +38,14 @@ Run from the project root::
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+log = logging.getLogger(__name__)
 
 # Decay rate for the exponential fatigue model (per day).
 # At λ=0.2 a game played 5 days ago contributes e^(-1) ≈ 37% of its original load;
@@ -67,11 +70,12 @@ ELO_MOV_BASELINE: float = 8.0
 # 0 OT → 1.0×  |  1 OT → 0.67×  |  2 OT → 0.50×  |  3 OT → 0.40×
 ELO_OT_DISCOUNT: float = 0.5
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+_HERE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_HERE_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_HERE_PROJECT_ROOT))
 
-from src.utils.io import read_interim, write_processed  # noqa: E402
+from src.utils.display import print_table  # noqa: E402
+from src.utils.io import PROJECT_ROOT, read_interim, write_processed  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -146,11 +150,13 @@ def compute_elo_ratings(
 
     log_baseline = np.log1p(mov_baseline)
 
+    skipped: list[str] = []
     # groupby with sort=False preserves the chronological order established above.
     for game_id, group in games.groupby("game_id", sort=False):
         home_row = group[group["is_home"]]
         away_row = group[~group["is_home"]]
         if home_row.empty or away_row.empty:
+            skipped.append(str(game_id))
             continue
         home = home_row.iloc[0]
         away = away_row.iloc[0]
@@ -192,6 +198,14 @@ def compute_elo_ratings(
         home_games[h_id] = h_played + 1
         if s_h == 1.0:
             home_wins[h_id] = home_wins.get(h_id, 0) + 1
+
+    if skipped:
+        preview = ", ".join(skipped[:5]) + (" ..." if len(skipped) > 5 else "")
+        log.warning(
+            "compute_elo_ratings: skipped %d game(s) missing a home or away row: %s",
+            len(skipped),
+            preview,
+        )
 
     return pd.DataFrame.from_records(records)
 
@@ -290,21 +304,27 @@ def _fatigue_decay_player(group: pd.DataFrame, lam: float) -> pd.Series:
     The current game's minutes are *not* included (look-back only).
     DNP rows (NaN minutes) contribute 0 load.
 
-    Parameters
-    ----------
-    group:
-        Single-player slice of the player features DataFrame, sorted by date.
-    lam:
-        Decay rate constant (days⁻¹).
+    Implementation: O(n) via cumulative products. Let D_k = Π_{i<k} e^{-λ Δ_i}
+    where Δ_i = t_{i+1} - t_i. Then fatigue_i = D_i · Σ_{j<i} m_j / D_j.
+    Both the cumulative product and cumulative sum are vectorised, so no
+    Python-level per-game loop is required.
     """
     group = group.sort_values("game_date")
-    dates = group["game_date"].values               # numpy datetime64[ns]
-    minutes = group["minutes_decimal"].fillna(0).values
+    dates = group["game_date"].values                        # datetime64[ns]
+    minutes = group["minutes_decimal"].fillna(0).to_numpy(dtype=float)
     n = len(group)
     result = np.zeros(n)
-    for i in range(1, n):
-        days = (dates[i] - dates[:i]) / np.timedelta64(1, "D")
-        result[i] = float(np.dot(minutes[:i], np.exp(-lam * days)))
+    if n < 2:
+        return pd.Series(result, index=group.index)
+
+    deltas = np.diff(dates) / np.timedelta64(1, "D")         # length n-1
+    decay = np.exp(-lam * deltas)                             # length n-1
+    # D[k] = Π_{i=0..k-1} decay[i], with D[0] = 1.
+    D = np.concatenate(([1.0], np.cumprod(decay)))            # length n
+    # fatigue[i] = D[i] * cumsum_{j<i}(minutes[j] / D[j])
+    m_over_D = minutes[:-1] / D[:-1]                          # length n-1
+    csum = np.cumsum(m_over_D)                                # length n-1
+    result[1:] = D[1:] * csum
     return pd.Series(result, index=group.index)
 
 
@@ -317,19 +337,22 @@ def _acwr_player(group: pd.DataFrame) -> pd.Series:
     reflects the load leading into the current game rather than including it.
     Returns NaN when the chronic window is empty (no prior games in 28 days).
 
-    Parameters
-    ----------
-    group:
-        Single-player slice sorted by date, with a ``game_date`` column and
-        a ``minutes_decimal`` column.
+    Same-date duplicates (rare in NBA, but possible) are preserved: the
+    rolling operation is performed on a positional-index ``DataFrame`` with
+    ``game_date`` as an auxiliary column, and results are aligned back to the
+    original row index rather than keyed on date.
     """
-    g = group.set_index("game_date")["minutes_decimal"].fillna(0).sort_index()
-    acute = g.rolling("7D", closed="left").sum()
-    chronic_weekly = g.rolling("28D", closed="left").sum() / 4
-    ratio = acute / chronic_weekly.replace(0, np.nan)
-    # ratio is indexed by game_date; map back to the original positional index
-    date_to_ratio = ratio.to_dict()
-    return group["game_date"].map(date_to_ratio)
+    g = group[["game_date", "minutes_decimal"]].sort_values("game_date").copy()
+    g["minutes_decimal"] = g["minutes_decimal"].fillna(0)
+    # Rolling with a time offset requires a DatetimeIndex.  Duplicate dates
+    # are allowed; pandas handles them positionally within a window.
+    tmp = g.set_index(pd.DatetimeIndex(g["game_date"]))
+    acute = tmp["minutes_decimal"].rolling("7D", closed="left").sum()
+    chronic_weekly = tmp["minutes_decimal"].rolling("28D", closed="left").sum() / 4
+    ratio = (acute / chronic_weekly.replace(0, np.nan)).to_numpy()
+    # Align back to the original (un-sorted) group index via g's preserved order.
+    out = pd.Series(ratio, index=g.index)
+    return out.reindex(group.index)
 
 
 def build_player_features(
@@ -501,25 +524,6 @@ def compute_features_from_data(
 
 
 # ---------------------------------------------------------------------------
-# Display helpers
-# ---------------------------------------------------------------------------
-
-def _print_table(title: str, df: pd.DataFrame, max_cols: int = 12) -> None:
-    """Pretty-print a DataFrame with a heading, splitting wide tables into
-    column blocks so they fit a standard terminal."""
-    sep = "=" * 72
-    print(f"\n{sep}")
-    print(f"  {title}  ({df.shape[0]} rows × {df.shape[1]} cols)")
-    print(sep)
-    cols = list(df.columns)
-    for start in range(0, len(cols), max_cols):
-        chunk = cols[start: start + max_cols]
-        print(df[chunk].to_string(index=True))
-        if start + max_cols < len(cols):
-            print()
-
-
-# ---------------------------------------------------------------------------
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
@@ -610,8 +614,8 @@ def run_pipeline(
             print(f"  -> {dest.relative_to(PROJECT_ROOT)}")
 
     if verbose and cutoff_date is None:
-        _print_table("team_features", outputs["team_features"])
-        _print_table("player_features", outputs["player_features"])
+        print_table("team_features", outputs["team_features"])
+        print_table("player_features", outputs["player_features"])
 
     return outputs
 

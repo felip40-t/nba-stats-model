@@ -14,7 +14,7 @@ The target milestone is **working software ready for the 2026 NBA playoffs**.
 
 ## Current Status
 
-**Version 1.0** — The full pipeline is operational end-to-end on test data (2024-25 season). The rolling training simulation is fully implemented; further refinements are needed before running it on a full season. See [Roadmap](#roadmap) for what is still to be done.
+**Version 2.0** — The full pipeline has been run end-to-end on the 2024-25 regular season. Team feature coverage was expanded (assists, rebounds, steals, blocks, turnovers, fouls, FTA, FT%, plus-minus) and the evaluation stage was extended to nine diagnostic plots. A pytest suite now covers the processing, feature, and training modules. See [Roadmap](#roadmap) for what is still to be done.
 
 | Stage | Status |
 |---|---|
@@ -24,8 +24,9 @@ The target milestone is **working software ready for the 2026 NBA playoffs**.
 | Elo ratings (team-specific home advantage, MOV-adjusted) | Done |
 | Player fatigue metrics (decay + ACWR) | Done |
 | Rolling day-by-day training simulation | Done |
-| Playoffs model (full regular-season train) | Done |
-| Model evaluation (metrics + 9 diagnostic plots) | Done (pending full-season run) |
+| Playoffs model (full regular-season train) | Done (pending train + eval) |
+| Model evaluation (metrics + 9 diagnostic plots) | Done |
+| Test suite (pytest smoke tests for process, features, train) | Done |
 
 ---
 
@@ -195,38 +196,42 @@ Loads `rolling_predictions.parquet` and the saved model, prints log-loss, Brier 
 
 The items below are planned for future versions, roughly in priority order.
 
-### Performance optimisation of the rolling simulation
+### Elo & home-court
 
-The current fatigue computation (`_fatigue_decay_player`) is O(n²) per player. For a full 82-game season with ~450 active players the simulation can be slow. Planned fixes:
+- **Bayesian prior on home-court advantage** — replace the hard-scaled `H` formula with a Beta-posterior updated from observed home results; prevents wild swings from small samples early in the season
+- **Carry forward prior-season Elo** — decay end-of-season ratings ~75% toward the mean (1500) rather than hard-resetting; eliminates the cold-start problem in early-season predictions
+- **Grid-search Elo hyperparameters** — optimise `ELO_K` and `ELO_MOV_BASELINE` against rolling log-loss; the current defaults are plausible but unvalidated
+- **ELO_K scheduling** — use a higher K early in the season when teams are most uncertain, decaying toward a lower floor as sample size grows
 
-- Incremental Elo updates — carry forward the previous day's ratings rather than replaying from game 1
-- Incremental fatigue computation — update rather than recompute from scratch
-- Vectorise the inner fatigue loop with NumPy broadcasting
+### Feature engineering
 
-### Additional rolling statistics
-
+- **Real OREB%** using opponent DREB — replace the current team-only calculation with `OREB / (OREB + opp_DREB)`, which is the correct formula and requires joining opponent box-score data
+- **Recent form** — short-window (last 5–10 games) rolling averages alongside the expanding average to capture momentum and slumps
 - **Opponent-adjusted stats** — rolling averages accounting for the quality of opponents faced
-- **Recent form** — short-window (last 5–10 games) rolling averages alongside the season-long expanding average to capture momentum and slumps
 - **Home/away splits** — separate rolling averages for home and away performance
 - **Defensive metrics** — opponent points allowed, opponent FG% allowed, defensive rating
 - **Pace and possession metrics** — possessions per game, offensive and defensive rating
+- **Travel fatigue** — miles traveled and time zones crossed before each game; orthogonal to minutes-based fatigue
+- **Schedule density** — rolling games-per-7-days; captures cumulative compression beyond individual back-to-backs
+- **Head-to-head rolling win rate** — persistent matchup asymmetries not fully captured by Elo
 
-### Advanced player features
+### Model inputs
 
-- **Player experience** — season number, career games played, age; relevant for reliability and expected variance
-- **Player form and momentum** — short-window deviations from seasonal average for points and minutes; captures hot/cold streaks and whether a player is being leaned on more than usual
-- **Injury and rest context** — extended days-off tracking, whether a player is returning from a known absence, back-to-back fatigue flags
-- **Rotation stability** — variance in minutes across recent games as a proxy for role certainty
+- **Drop `plus_minus_delta`** — noisy composite of everything else already in the feature set; likely adding variance without signal
+- **Audit missing engineered features** — `3p_pct_delta`, `ts_pct_delta`, `3p_rate_delta`, and `oreb_pct_delta` are engineered but absent from model inputs; evaluate and add the informative ones
+- **Calibration post-processing** — Platt scaling or isotonic regression on rolling predictions
+- **Gradient boosting** — XGBoost / LightGBM as a second model alongside logistic regression
+- **Feature selection** — systematic L1 vs L2 regularisation comparison
 
-### Model improvements
+### Player features
 
-- **Gradient boosting** (XGBoost / LightGBM) as a second baseline alongside logistic regression
-- **Calibration post-processing** — Platt scaling or isotonic regression to improve probability reliability
-- **Feature selection** — systematic comparison of L1 vs L2 regularisation
+- **Player experience** — season number, career games played, age
+- **Player form** — short-window deviations from seasonal average for points and minutes
+- **Injury and rest context** — extended days-off tracking, returning-from-absence flags
+- **Rotation stability** — variance in recent minutes as a proxy for role certainty
 
 ### Infrastructure
 
-- Jupyter notebooks for exploratory analysis and Elo time-series visualisation
 - Automated full-season pipeline runner with progress logging
 
 ---
@@ -258,7 +263,9 @@ The current fatigue computation (`_fatigue_decay_player`) is O(n²) per player. 
 ```text
 nba-stats-model/
 │
+├─ CLAUDE.md
 ├─ README.md
+├─ pyproject.toml                   ← build system, pytest config, ruff config
 ├─ requirements.txt
 ├─ .gitignore
 │
@@ -267,8 +274,6 @@ nba-stats-model/
 │       ├─ raw/                     ← fetched from nba_api, never edited
 │       ├─ interim/                 ← cleaned & restructured by process.py
 │       └─ processed/               ← model-ready features from features.py
-│
-├─ notebooks/
 │
 ├─ src/
 │   ├─ data/
@@ -281,9 +286,14 @@ nba-stats-model/
 │   │   └─ evaluate.py             ← Stage 5: evaluation and diagnostic plots
 │   │
 │   └─ utils/
-│       └─ io.py                    ← shared path constants and Parquet helpers
+│       ├─ io.py                    ← shared path constants and Parquet helpers
+│       └─ display.py               ← CLI table-printing helper (print_table)
 │
 ├─ tests/
+│   ├─ conftest.py                  ← adds project root to sys.path for pytest
+│   ├─ test_process.py              ← smoke tests for process.py
+│   ├─ test_features.py             ← smoke tests for features.py
+│   └─ test_train.py                ← smoke tests for train.py
 │
 └─ outputs/
     ├─ models/                      ← fitted model + rolling predictions
@@ -352,6 +362,12 @@ python src/models/train.py --min-train-games 100
 
 The active season is controlled by `SEASON` in `src/utils/io.py`. Changing it to a new year automatically reroutes all data paths.
 
+**Run the test suite:**
+
+```bash
+python -m pytest tests/
+```
+
 ---
 
 ## Technologies Used
@@ -365,7 +381,6 @@ The active season is controlled by `SEASON` in `src/utils/io.py`. Changing it to
 | [nba_api](https://github.com/swar/nba_api) | NBA Stats API client |
 | [pyarrow](https://arrow.apache.org/docs/python/) | Apache Parquet I/O |
 | [joblib](https://joblib.readthedocs.io/) | Model serialisation |
-| [JupyterLab](https://jupyterlab.readthedocs.io/) | Interactive exploration |
 
 ---
 

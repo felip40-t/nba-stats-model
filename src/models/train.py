@@ -52,16 +52,17 @@ import sys
 from pathlib import Path
 
 import joblib
+import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+_HERE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_HERE_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_HERE_PROJECT_ROOT))
 
-from src.utils.io import MODELS_DIR, read_processed, read_schedule  # noqa: E402
+from src.utils.io import MODELS_DIR, PROJECT_ROOT, read_processed, read_schedule  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -138,11 +139,21 @@ def build_game_rows(
     sched["home_team_id"] = sched["home_team_id"].astype("Int64")
     sched["away_team_id"] = sched["away_team_id"].astype("Int64")
 
+    # Inner-join drops games not represented in team_features.  That is usually
+    # fine (unplayed future games, or pre-threshold rows), but it can also mask
+    # a data bug (e.g. a team_id mismatch) — warn so callers see the scale.
     games = (
         sched
         .merge(home_tf, on=["game_id", "home_team_id"], how="inner")
         .merge(away_tf, on=["game_id", "away_team_id"], how="inner")
     )
+    scheduled = len(sched)
+    matched = len(games)
+    if matched < scheduled:
+        log.info(
+            "build_game_rows: matched %d of %d scheduled games to team features (dropped %d).",
+            matched, scheduled, scheduled - matched,
+        )
 
     games["home_win"] = games["home_win"].astype(int)
     return games.sort_values("game_date").reset_index(drop=True)
@@ -171,12 +182,18 @@ def compute_deltas(games: pd.DataFrame) -> pd.DataFrame:
 
 
 def drop_missing(games: pd.DataFrame) -> pd.DataFrame:
-    """Drop rows where any model feature is NaN."""
+    """Drop rows where any model feature is NaN.
+
+    Logs at INFO rather than DEBUG so a silent data bug is immediately visible
+    in the training logs.  Early-season drops are expected (features need
+    several games of history); an unexpectedly large drop later in the season
+    usually means upstream data is missing.
+    """
     before = len(games)
     games = games.dropna(subset=MODEL_FEATURES + ["home_win"]).copy()
     dropped = before - len(games)
     if dropped:
-        log.debug("Dropped %d game(s) with NaN features.", dropped)
+        log.info("drop_missing: dropped %d of %d game rows with NaN features.", dropped, before)
     return games
 
 
@@ -235,12 +252,16 @@ def build_rolling_predictions(
         ``home_team_id``, ``away_team_id``, ``home_win``,
         ``predicted_proba``, ``predicted_label``.
     """
-    game_dates = sorted(games["game_date"].dt.date.unique())
+    # Work in Timestamp space (faster than Python ``datetime.date`` and avoids
+    # per-row object conversion every iteration).  ``normalize()`` zeroes the
+    # time-of-day component so same-day games collapse cleanly.
+    day = games["game_date"].dt.normalize()
+    game_dates = np.sort(day.unique())
     all_predictions: list[pd.DataFrame] = []
 
     for i, date in enumerate(game_dates):
-        train = games[games["game_date"].dt.date < date]
-        today = games[games["game_date"].dt.date == date]
+        train = games[day < date]
+        today = games[day == date]
 
         if len(train) < min_train_games or len(today) == 0:
             log.info("  [%d/%d] %s : skipped (only %d training games)",

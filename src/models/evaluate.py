@@ -35,11 +35,11 @@ import numpy as np
 import pandas as pd
 from sklearn.metrics import accuracy_score, brier_score_loss, log_loss, roc_auc_score, roc_curve
 
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+_HERE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_HERE_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_HERE_PROJECT_ROOT))
 
-from src.utils.io import FIGURES_DIR, MODELS_DIR, read_processed  # noqa: E402
+from src.utils.io import FIGURES_DIR, MODELS_DIR, PROJECT_ROOT, read_processed  # noqa: E402
 from src.models.train import MODEL_FEATURES  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")

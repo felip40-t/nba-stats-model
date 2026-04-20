@@ -38,11 +38,12 @@ import pandas as pd
 
 # Make sure the project root is on sys.path so ``src`` is importable when
 # the script is run directly (python src/data/process.py).
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+_HERE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(_HERE_PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(_HERE_PROJECT_ROOT))
 
-from src.utils.io import read_raw, write_interim  # noqa: E402
+from src.utils.display import print_table  # noqa: E402
+from src.utils.io import PROJECT_ROOT, read_raw, write_interim  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -164,13 +165,14 @@ def _add_is_back_to_back(df: pd.DataFrame) -> pd.DataFrame:
 
     The flag is computed per team by sorting on ``game_date`` and checking
     whether the gap to the previous game equals exactly one calendar day.
-    With only a single game in the dataset every team's flag will be False;
-    the logic is correct for multi-game datasets.
+    Input row order is preserved: shifts are computed on a sorted view, then
+    the result is reindexed back to the caller's original index.
     """
     df = df.copy()
-    df = df.sort_values(["team_id", "game_date"])
-    prev_date = df.groupby("team_id")["game_date"].shift(1)
-    df["is_back_to_back"] = (df["game_date"] - prev_date).dt.days == 1
+    sorted_view = df.sort_values(["team_id", "game_date"])
+    prev_date = sorted_view.groupby("team_id")["game_date"].shift(1)
+    b2b = (sorted_view["game_date"] - prev_date).dt.days == 1
+    df["is_back_to_back"] = b2b.reindex(df.index)
     return df
 
 
@@ -324,29 +326,6 @@ def build_team_advanced(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Display helpers
-# ---------------------------------------------------------------------------
-
-def _print_table(title: str, df: pd.DataFrame, max_cols: int = 12) -> None:
-    """Pretty-print a DataFrame to stdout with a heading.
-
-    Shows all rows but limits visible columns to ``max_cols`` per block so
-    the output stays readable in a terminal without horizontal scrolling.
-    """
-    sep = "=" * 72
-    print(f"\n{sep}")
-    print(f"  {title}  ({df.shape[0]} rows × {df.shape[1]} cols)")
-    print(sep)
-
-    cols = list(df.columns)
-    for start in range(0, len(cols), max_cols):
-        chunk = cols[start: start + max_cols]
-        print(df[chunk].to_string(index=True))
-        if start + max_cols < len(cols):
-            print()  # blank line between column blocks
-
-
-# ---------------------------------------------------------------------------
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
@@ -419,9 +398,9 @@ def run_pipeline(
 
     # --- display ------------------------------------------------------------
     if verbose:
-        _print_table(f"game_log{suffix}", game_log)
-        _print_table(f"player_game_log{suffix}", player_game_log)
-        _print_table(f"team_advanced{suffix}", team_advanced)
+        print_table(f"game_log{suffix}", game_log)
+        print_table(f"player_game_log{suffix}", player_game_log)
+        print_table(f"team_advanced{suffix}", team_advanced)
 
     return outputs
 
