@@ -14,9 +14,8 @@ Rolling simulation (default)
 
 Playoffs mode (``--playoffs``)
     Trains a single model on the entire regular-season processed feature
-    snapshot and saves it as ``win_probability_logreg_playoffs.joblib``.
-    Use this after the regular season ends to prepare a model ready to
-    predict playoff match-ups.
+    snapshot.  Use this after the regular season ends to prepare a model
+    ready to predict playoff match-ups.
 
 Feature set
 -----------
@@ -56,8 +55,10 @@ h2h_delta               home_h2h_win_rate - away_h2h_win_rate
 
 Run from the project root::
 
-    python src/models/train.py                  # rolling simulation
-    python src/models/train.py --playoffs        # full-season model for playoffs
+    python src/models/train.py                           # logreg rolling simulation
+    python src/models/train.py --model xgboost           # xgboost rolling simulation
+    python src/models/train.py --playoffs                # logreg playoffs model
+    python src/models/train.py --model xgboost --playoffs  # xgboost playoffs model
 """
 
 from __future__ import annotations
@@ -65,7 +66,9 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import joblib
 import numpy as np
@@ -73,6 +76,7 @@ import pandas as pd
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
+from xgboost import XGBClassifier
 
 _HERE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_HERE_PROJECT_ROOT) not in sys.path:
@@ -135,6 +139,22 @@ MODEL_FEATURES = [
     "acwr_delta",
     "h2h_delta",
 ]
+
+XGBOOST_DEFAULT_PARAMS: dict = {
+    "n_estimators": 300,
+    "max_depth": 4,
+    "learning_rate": 0.05,
+    "subsample": 0.8,
+    "colsample_bytree": 0.8,
+    "min_child_weight": 5,
+    "gamma": 0.1,
+    "reg_alpha": 0.1,
+    "reg_lambda": 1.0,
+    "objective": "binary:logistic",
+    "eval_metric": "logloss",
+    "random_state": 42,
+    "n_jobs": -1,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -259,7 +279,7 @@ def drop_missing(games: pd.DataFrame) -> pd.DataFrame:
 # Model training
 # ---------------------------------------------------------------------------
 
-def train_model(train: pd.DataFrame) -> Pipeline:
+def train_logreg(train: pd.DataFrame) -> Pipeline:
     """Fit a logistic regression pipeline on the given game rows."""
     X_train = train[MODEL_FEATURES]
     y_train = train["home_win"]
@@ -272,6 +292,15 @@ def train_model(train: pd.DataFrame) -> Pipeline:
     return pipeline
 
 
+def train_xgboost(train: pd.DataFrame) -> XGBClassifier:
+    """Fit an XGBClassifier on the given game rows."""
+    X_train = train[MODEL_FEATURES]
+    y_train = train["home_win"]
+    model = XGBClassifier(**XGBOOST_DEFAULT_PARAMS)
+    model.fit(X_train, y_train)
+    return model
+
+
 # ---------------------------------------------------------------------------
 # Rolling simulation
 # ---------------------------------------------------------------------------
@@ -279,6 +308,7 @@ def train_model(train: pd.DataFrame) -> Pipeline:
 def build_rolling_predictions(
     games: pd.DataFrame,
     min_train_games: int = 50,
+    train_fn: Callable[[pd.DataFrame], Any] = train_logreg,
 ) -> pd.DataFrame:
     """Simulate the model predicting each game using only prior data.
 
@@ -326,7 +356,7 @@ def build_rolling_predictions(
                      i + 1, len(game_dates), date, len(train))
             continue
 
-        model = train_model(train)
+        model = train_fn(train)
         proba = model.predict_proba(today[MODEL_FEATURES])[:, 1]
         pred_label = model.predict(today[MODEL_FEATURES])
 
@@ -352,12 +382,17 @@ def build_rolling_predictions(
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train the NBA win-probability model.")
     p.add_argument(
+        "--model",
+        choices=["logreg", "xgboost"],
+        default="logreg",
+        help="Model type to train (default: logreg).",
+    )
+    p.add_argument(
         "--playoffs",
         action="store_true",
         help=(
             "Train on all regular-season data at once and save a playoffs-ready "
-            "model (win_probability_logreg_playoffs.joblib).  Skips the rolling "
-            "simulation."
+            "model.  Skips the rolling simulation."
         ),
     )
     p.add_argument(
@@ -372,6 +407,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
+
+    _TRAIN_FN: dict[str, Callable[[pd.DataFrame], Any]] = {
+        "logreg":  train_logreg,
+        "xgboost": train_xgboost,
+    }
+    train_fn = _TRAIN_FN[args.model]
 
     # ------------------------------------------------------------------
     # Load processed features (written by features.py).
@@ -401,10 +442,13 @@ def main(argv: list[str] | None = None) -> None:
         # ------------------------------------------------------------------
         # Playoffs mode: train one model on all regular-season data.
         # ------------------------------------------------------------------
-        log.info("Playoffs mode: training on full regular-season dataset (%d games) ...", len(games))
-        model = train_model(games)
+        log.info(
+            "Playoffs mode: training %s on full regular-season dataset (%d games) ...",
+            args.model, len(games),
+        )
+        model = train_fn(games)
 
-        model_path = MODELS_DIR / "win_probability_logreg_playoffs.joblib"
+        model_path = MODELS_DIR / f"win_probability_{args.model}_playoffs.joblib"
         joblib.dump(model, model_path)
         log.info("Playoffs model saved → %s", model_path.relative_to(PROJECT_ROOT))
 
@@ -413,18 +457,22 @@ def main(argv: list[str] | None = None) -> None:
         # Rolling mode: predict each game using only prior-date data,
         # then train a final model on the complete season.
         # ------------------------------------------------------------------
-        log.info("Starting rolling day-by-day simulation ...")
-        rolling_preds = build_rolling_predictions(games, min_train_games=args.min_train_games)
+        log.info("Starting rolling day-by-day simulation (%s) ...", args.model)
+        rolling_preds = build_rolling_predictions(
+            games,
+            min_train_games=args.min_train_games,
+            train_fn=train_fn,
+        )
         log.info("  predictions collected : %d", len(rolling_preds))
 
-        pred_path = MODELS_DIR / "rolling_predictions.parquet"
+        pred_path = MODELS_DIR / f"rolling_predictions_{args.model}.parquet"
         rolling_preds.to_parquet(pred_path, index=False)
         log.info("Rolling predictions saved → %s", pred_path.relative_to(PROJECT_ROOT))
 
         log.info("Training final model on full season (%d games) ...", len(games))
-        final_model = train_model(games)
+        final_model = train_fn(games)
 
-        model_path = MODELS_DIR / "win_probability_logreg.joblib"
+        model_path = MODELS_DIR / f"win_probability_{args.model}.joblib"
         joblib.dump(final_model, model_path)
         log.info("Model saved → %s", model_path.relative_to(PROJECT_ROOT))
 

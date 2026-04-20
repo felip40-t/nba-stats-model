@@ -1,29 +1,34 @@
 """
-evaluate.py — Evaluate the trained win-probability logistic regression.
+evaluate.py — Evaluate a trained win-probability model.
 
 Loads the saved model and rolling predictions, then produces:
 
 Console
     Log-loss, Brier score, accuracy.
 
-Figures (saved to outputs/figures/)
-    calibration_curve.png       Predicted probability vs actual win rate.
-    feature_coefficients.png    Model coefficients sorted by magnitude.
-    elo_time_series.png         Per-team Elo rating progression (small multiples).
-    elo_all_teams.png           All 30 teams' Elo ratings overlaid on one chart.
-    rolling_accuracy.png        Prediction accuracy throughout the season.
-    roc_curve.png               ROC curve with AUC.
-    confidence_histogram.png    Distribution of predicted probabilities.
-    accuracy_by_confidence.png  Accuracy binned by model confidence level.
-    team_accuracy.png           Per-team prediction accuracy ranked bar chart.
+Figures
+    outputs/figures/logreg/   (or xgboost/) — model-specific plots:
+        calibration_curve.png       Predicted probability vs actual win rate.
+        feature_coefficients.png    Logistic regression coefficients (logreg only).
+        feature_importance.png      XGBoost feature importances (xgboost only).
+        rolling_accuracy.png        Prediction accuracy throughout the season.
+        roc_curve.png               ROC curve with AUC.
+        confidence_histogram.png    Distribution of predicted probabilities.
+        accuracy_by_confidence.png  Accuracy binned by model confidence level.
+        team_accuracy.png           Per-team prediction accuracy ranked bar chart.
+    outputs/figures/          — model-agnostic plots (shared):
+        elo_time_series.png         Per-team Elo rating progression (small multiples).
+        elo_all_teams.png           All 30 teams' Elo ratings overlaid on one chart.
 
 Run from the project root::
 
-    python src/models/evaluate.py
+    python src/models/evaluate.py                  # evaluate logreg
+    python src/models/evaluate.py --model xgboost  # evaluate xgboost
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -41,6 +46,9 @@ if str(_HERE_PROJECT_ROOT) not in sys.path:
 
 from src.utils.io import FIGURES_DIR, MODELS_DIR, PROJECT_ROOT, read_processed  # noqa: E402
 from src.models.train import MODEL_FEATURES  # noqa: E402
+
+FIGURES_LOGREG_DIR  = FIGURES_DIR / "logreg"
+FIGURES_XGBOOST_DIR = FIGURES_DIR / "xgboost"
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -144,7 +152,7 @@ def plot_calibration_curve(
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     _legend(ax, loc="upper left")
-    fig.suptitle("Calibration curve — logistic regression", color=TEXT, fontsize=12, x=0.01, ha="left")
+    fig.suptitle("Calibration curve", color=TEXT, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,6 +192,31 @@ def plot_feature_coefficients(
     fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
     plt.close(fig)
     log.info("Feature coefficients → %s", out_path.relative_to(PROJECT_ROOT))
+
+
+def plot_feature_importance(
+    model,
+    out_path: Path = FIGURES_XGBOOST_DIR / "feature_importance.png",
+) -> None:
+    importances = model.feature_importances_
+
+    order           = np.argsort(importances)[::-1]
+    sorted_features = [MODEL_FEATURES[i] for i in order]
+    sorted_imps     = importances[order]
+
+    fig, ax = plt.subplots(figsize=(7, max(3, 0.5 * len(MODEL_FEATURES))), dpi=150)
+    _style_fig(fig)
+    _style_ax(ax)
+
+    ax.barh(sorted_features[::-1], sorted_imps[::-1], color=BLUE, zorder=2)
+    ax.set_xlabel("Feature importance (gain)", color=TEXT, fontsize=9, labelpad=8)
+    fig.suptitle("XGBoost feature importance", color=TEXT, fontsize=12, x=0.01, ha="left")
+    fig.tight_layout()
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
+    plt.close(fig)
+    log.info("Feature importance → %s", out_path.relative_to(PROJECT_ROOT))
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +422,7 @@ def plot_roc_curve(
     ax.set_xlabel("False positive rate", color=TEXT, fontsize=9, labelpad=8)
     ax.set_ylabel("True positive rate", color=TEXT, fontsize=9, labelpad=8)
     _legend(ax, loc="lower right")
-    fig.suptitle("ROC curve — logistic regression", color=TEXT, fontsize=12, x=0.01, ha="left")
+    fig.suptitle("ROC curve", color=TEXT, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -556,9 +589,24 @@ def plot_team_accuracy(
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    model_path = MODELS_DIR / "win_probability_logreg.joblib"
-    pred_path  = MODELS_DIR / "rolling_predictions.parquet"
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Evaluate a trained NBA win-probability model.")
+    p.add_argument(
+        "--model",
+        choices=["logreg", "xgboost"],
+        default="logreg",
+        help="Model type to evaluate (default: logreg).",
+    )
+    return p.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = _parse_args(argv)
+    model_name = args.model
+
+    model_path = MODELS_DIR / f"win_probability_{model_name}.joblib"
+    pred_path  = MODELS_DIR / f"rolling_predictions_{model_name}.parquet"
+    fig_dir    = FIGURES_LOGREG_DIR if model_name == "logreg" else FIGURES_XGBOOST_DIR
 
     log.info("Loading model from %s ...", model_path.relative_to(PROJECT_ROOT))
     model = joblib.load(model_path)
@@ -570,20 +618,25 @@ def main() -> None:
     team_features = read_processed("team_features.parquet")
     elo_ratings   = read_processed("elo_ratings.parquet")
 
-    y_true = preds["home_win"]
+    y_true  = preds["home_win"]
     y_proba = preds["predicted_proba"].values
     y_pred  = preds["predicted_label"].values
 
     print_metrics(y_true, y_proba, y_pred)
-    plot_calibration_curve(y_true, y_proba)
-    plot_feature_coefficients(model)
+
+    if model_name == "logreg":
+        plot_feature_coefficients(model, out_path=fig_dir / "feature_coefficients.png")
+    else:
+        plot_feature_importance(model, out_path=fig_dir / "feature_importance.png")
+
     plot_elo_time_series(elo_ratings, team_features)
     plot_elo_all_teams(elo_ratings, team_features)
-    plot_rolling_accuracy(preds)
-    plot_roc_curve(y_true, y_proba)
-    plot_confidence_histogram(y_true, y_proba)
-    plot_accuracy_by_confidence(y_true, y_proba)
-    plot_team_accuracy(preds, team_features)
+    plot_calibration_curve(y_true, y_proba, out_path=fig_dir / "calibration_curve.png")
+    plot_rolling_accuracy(preds, out_path=fig_dir / "rolling_accuracy.png")
+    plot_roc_curve(y_true, y_proba, out_path=fig_dir / "roc_curve.png")
+    plot_confidence_histogram(y_true, y_proba, out_path=fig_dir / "confidence_histogram.png")
+    plot_accuracy_by_confidence(y_true, y_proba, out_path=fig_dir / "accuracy_by_confidence.png")
+    plot_team_accuracy(preds, team_features, out_path=fig_dir / "team_accuracy.png")
 
     print("\nDone.")
 
