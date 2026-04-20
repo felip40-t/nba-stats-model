@@ -14,7 +14,7 @@ The target milestone is **working software ready for the 2026 NBA playoffs**.
 
 ## Current Status
 
-**Version 2.0** — The full pipeline has been run end-to-end on the 2024-25 regular season. Team feature coverage was expanded (assists, rebounds, steals, blocks, turnovers, fouls, FTA, FT%, plus-minus) and the evaluation stage was extended to nine diagnostic plots. A pytest suite now covers the processing, feature, and training modules. See [Roadmap](#roadmap) for what is still to be done.
+**Version 2.2.0** — Added prior-season Elo carry-over (end-of-season ratings regressed 50% toward 1500 before the new season begins), an Elo hyperparameter grid search script (`elo_grid_search.py`), and a feature-analysis toolkit (`tests/feature_tests.py`) covering L1 sweep, permutation importance, ablation, and VIF. The active model now trains on 5 core features while the full delta feature set (50+ columns) remains computed and available for experimentation. See [Roadmap](#roadmap) for what is still to be done.
 
 | Stage | Status |
 |---|---|
@@ -23,9 +23,17 @@ The target milestone is **working software ready for the 2026 NBA playoffs**.
 | Feature engineering (team + player) | Done |
 | Elo ratings (team-specific home advantage, MOV-adjusted) | Done |
 | Player fatigue metrics (decay + ACWR) | Done |
+| Efficiency metrics (TS%, 3P rate, FT rate, true OREB%) | Done |
+| Defensive metrics (opp pts/OREB/blocks/steals allowed) | Done |
+| Recent form windows (5 / 10 / 15 games) | Done |
+| Win streak and head-to-head win rate | Done |
+| Last-10-game rolling averages (23 stats) | Done |
+| Prior-season Elo carry-over (50% regression toward 1500) | Done |
+| Elo hyperparameter grid search (`elo_grid_search.py`) | Done |
 | Rolling day-by-day training simulation | Done |
 | Playoffs model (full regular-season train) | Done (pending train + eval) |
 | Model evaluation (metrics + 9 diagnostic plots) | Done |
+| Feature importance + collinearity analysis tools | Done |
 | Test suite (pytest smoke tests for process, features, train) | Done |
 
 ---
@@ -90,6 +98,8 @@ Reads interim tables and produces model-ready features in `data/<SEASON>/process
 
 Pass `--playoffs` to load `*_playoffs.parquet` interim files alongside the regular-season tables. Regular-season data is always included so Elo ratings carry over and rolling averages are not cold-started. Outputs are filtered to playoff game rows and written as `*_playoffs.parquet` processed files.
 
+When prior-season data exists in `data/<SEASON-1>/processed/`, the pipeline automatically loads each team's final Elo rating and regresses it 50% toward 1500 before the new season begins (`_load_prior_season_elo(carryover=0.5)`). This eliminates the early-season cold-start where all teams are equal. Teams absent from the prior-season snapshot fall back to the flat initial rating.
+
 #### Elo Ratings
 
 Games are replayed chronologically using a margin-of-victory-adjusted Elo formula:
@@ -109,7 +119,7 @@ The home-court bonus `H` is **team-specific**, scaling with the home team's prio
 H = max(HOME_ADV_MIN, HOME_ADV_BASE + (home_win_rate − 0.5) × HOME_ADV_SCALE)
 ```
 
-A team with a strong home record earns a larger bonus; the worst home teams are floored at `HOME_ADV_MIN`.
+A team with a strong home record earns a larger bonus; the worst home teams are floored at `HOME_ADV_MIN`. Current defaults: `HOME_ADV_BASE = 40`, `HOME_ADV_SCALE = 10`, `HOME_ADV_MIN = 20` — tuned via `elo_grid_search.py`.
 
 #### Fatigue Metrics (player-level)
 
@@ -144,27 +154,17 @@ Dates with fewer than `min_train_games` (default 50) complete training rows are 
 
 **Playoffs mode (`--playoffs`):** Trains a single logistic regression on the entire regular-season processed feature snapshot and saves it as `win_probability_logreg_playoffs.joblib`. Use after the regular season ends to prepare a model ready to predict playoff match-ups.
 
-**Model inputs** (home − away deltas):
+**Active model inputs** (`MODEL_FEATURES` — home − away deltas):
 
 | Feature | Description |
 |---|---|
 | `elo_delta` | `home_elo_pre − away_elo_pre` |
 | `home_adv` | Home team's team-specific Elo home-court bonus |
-| `win_rate_delta` | Season win rate differential |
-| `pts_delta` | Season average points differential |
-| `fg_pct_delta` | Season FG% differential |
-| `fatigue_delta` | Team fatigue differential |
-| `acwr_delta` | ACWR differential |
-| `ast_delta` | Season average assists differential |
-| `reb_delta` | Season average rebounds differential |
-| `oreb_delta` | Season average offensive rebounds differential |
-| `blk_delta` | Season average blocks differential |
-| `stl_delta` | Season average steals differential |
-| `tov_delta` | Season average turnovers differential |
-| `pf_delta` | Season average personal fouls differential |
-| `fta_delta` | Season average free-throw attempts differential |
-| `ft_pct_delta` | Season FT% differential |
-| `plus_minus_delta` | Season average plus-minus differential |
+| `fatigue_delta` | Team fatigue (minutes-weighted exponential decay) |
+| `acwr_delta` | Team Acute:Chronic Workload Ratio |
+| `h2h_delta` | Head-to-head win rate between these two teams |
+
+`compute_deltas()` computes the full set of 50+ home-minus-away delta columns (season-to-date averages, efficiency metrics, defensive metrics, recent form, win streak, last-10 rolling averages) — these are available in the game table for experimentation but are not currently included in `MODEL_FEATURES`. Use `tests/model_tests.py` to analyse which features are most informative.
 
 **Outputs:**
 
@@ -199,29 +199,21 @@ The items below are planned for future versions, roughly in priority order.
 ### Elo & home-court
 
 - **Bayesian prior on home-court advantage** — replace the hard-scaled `H` formula with a Beta-posterior updated from observed home results; prevents wild swings from small samples early in the season
-- **Carry forward prior-season Elo** — decay end-of-season ratings ~75% toward the mean (1500) rather than hard-resetting; eliminates the cold-start problem in early-season predictions
-- **Grid-search Elo hyperparameters** — optimise `ELO_K` and `ELO_MOV_BASELINE` against rolling log-loss; the current defaults are plausible but unvalidated
-- **ELO_K scheduling** — use a higher K early in the season when teams are most uncertain, decaying toward a lower floor as sample size grows
 
 ### Feature engineering
 
-- **Real OREB%** using opponent DREB — replace the current team-only calculation with `OREB / (OREB + opp_DREB)`, which is the correct formula and requires joining opponent box-score data
-- **Recent form** — short-window (last 5–10 games) rolling averages alongside the expanding average to capture momentum and slumps
 - **Opponent-adjusted stats** — rolling averages accounting for the quality of opponents faced
 - **Home/away splits** — separate rolling averages for home and away performance
-- **Defensive metrics** — opponent points allowed, opponent FG% allowed, defensive rating
+- **Opponent FG% allowed** — currently only volume defensive stats are tracked; allowing FG% per game would add shot quality
 - **Pace and possession metrics** — possessions per game, offensive and defensive rating
 - **Travel fatigue** — miles traveled and time zones crossed before each game; orthogonal to minutes-based fatigue
 - **Schedule density** — rolling games-per-7-days; captures cumulative compression beyond individual back-to-backs
-- **Head-to-head rolling win rate** — persistent matchup asymmetries not fully captured by Elo
 
 ### Model inputs
 
-- **Drop `plus_minus_delta`** — noisy composite of everything else already in the feature set; likely adding variance without signal
-- **Audit missing engineered features** — `3p_pct_delta`, `ts_pct_delta`, `3p_rate_delta`, and `oreb_pct_delta` are engineered but absent from model inputs; evaluate and add the informative ones
+- **Re-expand MODEL_FEATURES** — use `tests/feature_tests.py` (L1 sweep, permutation importance, ablation, VIF) to identify which of the 50+ computed deltas contribute signal, then add the survivors back to `MODEL_FEATURES`
 - **Calibration post-processing** — Platt scaling or isotonic regression on rolling predictions
 - **Gradient boosting** — XGBoost / LightGBM as a second model alongside logistic regression
-- **Feature selection** — systematic L1 vs L2 regularisation comparison
 
 ### Player features
 
@@ -248,12 +240,12 @@ The items below are planned for future versions, roughly in priority order.
 | `COOLDOWN_SECONDS` | `src/data/fetch_games.py` | `30.0` s | Duration of each cooldown pause |
 | `FATIGUE_LAMBDA` | `src/data/features.py` | `0.2` | Decay rate for exponential fatigue model (day⁻¹) |
 | `ELO_INITIAL` | `src/data/features.py` | `1500.0` | Starting Elo for all teams |
-| `ELO_K` | `src/data/features.py` | `20.0` | Elo K-factor (base update step size) |
-| `ELO_HOME_ADV_BASE` | `src/data/features.py` | `100.0` | Elo home-court bonus for a .500 home record |
-| `ELO_HOME_ADV_SCALE` | `src/data/features.py` | `100.0` | Sensitivity of home-court bonus to home win rate |
-| `ELO_HOME_ADV_MIN` | `src/data/features.py` | `50.0` | Floor for worst home-record teams |
+| `ELO_K` | `src/data/features.py` | `25.0` | Elo K-factor (base update step size) |
+| `ELO_HOME_ADV_BASE` | `src/data/features.py` | `40.0` | Elo home-court bonus for a .500 home record |
+| `ELO_HOME_ADV_SCALE` | `src/data/features.py` | `10.0` | Sensitivity of home-court bonus to home win rate |
+| `ELO_HOME_ADV_MIN` | `src/data/features.py` | `20.0` | Floor for worst home-record teams |
 | `ELO_MOV_BASELINE` | `src/data/features.py` | `8.0` | Point margin yielding a MOV multiplier of 1.0 (≈ median NBA win margin) |
-| `ELO_OT_DISCOUNT` | `src/data/features.py` | `0.5` | K reduction per OT period: `ot_factor = 1 / (1 + num_ot × discount)` |
+| `ELO_OT_DISCOUNT` | `src/data/features.py` | `0.2` | K reduction per OT period: `ot_factor = 1 / (1 + num_ot × discount)` |
 | `min_train_games` | `src/models/train.py` | `50` | Minimum training rows before rolling predictions begin |
 
 ---
@@ -283,7 +275,8 @@ nba-stats-model/
 │   │
 │   ├─ models/
 │   │   ├─ train.py                 ← Stage 4: rolling training simulation + playoffs model
-│   │   └─ evaluate.py             ← Stage 5: evaluation and diagnostic plots
+│   │   ├─ evaluate.py             ← Stage 5: evaluation and diagnostic plots
+│   │   └─ elo_grid_search.py      ← Grid search over Elo hyperparameters (standalone)
 │   │
 │   └─ utils/
 │       ├─ io.py                    ← shared path constants and Parquet helpers
@@ -293,7 +286,9 @@ nba-stats-model/
 │   ├─ conftest.py                  ← adds project root to sys.path for pytest
 │   ├─ test_process.py              ← smoke tests for process.py
 │   ├─ test_features.py             ← smoke tests for features.py
-│   └─ test_train.py                ← smoke tests for train.py
+│   ├─ test_train.py                ← smoke tests for train.py
+│   ├─ feature_tests.py             ← feature analysis utilities: L1 sweep, permutation importance, ablation, VIF
+│   └─ model_tests.py               ← script: run feature_tests against the trained model on disk
 │
 └─ outputs/
     ├─ models/                      ← fitted model + rolling predictions
@@ -334,6 +329,14 @@ python src/models/train.py
 
 # Stage 5 — evaluate and plot (9 diagnostic figures)
 python src/models/evaluate.py
+```
+
+**Optional — Elo hyperparameter grid search:**
+
+```bash
+# Search over K, home_adv_*, mov_baseline, ot_discount, carryover, inv_scale
+python src/models/elo_grid_search.py
+# Results saved to outputs/models/elo_grid_search_results.parquet
 ```
 
 **Common flags:**

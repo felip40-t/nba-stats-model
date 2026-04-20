@@ -24,19 +24,35 @@ elo_delta           home_elo_pre - away_elo_pre
 home_adv            home team's Elo home-court bonus
 win_rate_delta      home_season_win_rate - away_season_win_rate
 pts_delta           home_season_avg_pts - away_season_avg_pts
-fg_pct_delta        home_season_avg_fg_pct - away_season_avg_fg_pct
-fatigue_delta       home_team_fatigue - away_team_fatigue
-acwr_delta          home_team_acwr - away_team_acwr
-ast_delta           home_season_avg_ast - away_season_avg_ast
-reb_delta           home_season_avg_reb - away_season_avg_reb
-oreb_delta          home_season_avg_oreb - away_season_avg_oreb
-blk_delta           home_season_avg_blk - away_season_avg_blk
-stl_delta           home_season_avg_stl - away_season_avg_stl
-tov_delta           home_season_avg_tov - away_season_avg_tov
-pf_delta            home_season_avg_pf - away_season_avg_pf
-fta_delta           home_season_avg_fta - away_season_avg_fta
-ft_pct_delta        home_season_avg_ft_pct - away_season_avg_ft_pct
-plus_minus_delta    home_season_avg_plus_minus - away_season_avg_plus_minus
+fg_pct_delta            home_season_avg_fg_pct - away_season_avg_fg_pct
+fg3_pct_delta           home_season_avg_fg3_pct - away_season_avg_fg3_pct
+fatigue_delta           home_team_fatigue - away_team_fatigue
+acwr_delta              home_team_acwr - away_team_acwr
+ast_delta               home_season_avg_ast - away_season_avg_ast
+reb_delta               home_season_avg_reb - away_season_avg_reb
+oreb_delta              home_season_avg_oreb - away_season_avg_oreb
+blk_delta               home_season_avg_blk - away_season_avg_blk
+stl_delta               home_season_avg_stl - away_season_avg_stl
+tov_delta               home_season_avg_tov - away_season_avg_tov
+pf_delta                home_season_avg_pf - away_season_avg_pf
+fta_delta               home_season_avg_fta - away_season_avg_fta
+ft_pct_delta            home_season_avg_ft_pct - away_season_avg_ft_pct
+true_shooting_pct_delta home_season_avg_true_shooting_pct - away_season_avg_true_shooting_pct
+three_point_rate_delta  home_season_avg_three_point_rate - away_season_avg_three_point_rate
+free_throw_rate_delta   home_season_avg_free_throw_rate - away_season_avg_free_throw_rate
+oreb_pct_proxy_delta    home_season_avg_oreb_pct_proxy - away_season_avg_oreb_pct_proxy
+true_oreb_pct_delta     home_season_avg_true_oreb_pct - away_season_avg_true_oreb_pct
+opp_pts_delta           home_season_avg_opp_pts - away_season_avg_opp_pts
+opp_oreb_delta          home_season_avg_opp_oreb - away_season_avg_opp_oreb
+opp_oreb_pct_delta      home_season_avg_opp_oreb_pct - away_season_avg_opp_oreb_pct
+opp_blk_delta           home_season_avg_opp_blk - away_season_avg_opp_blk
+opp_stl_delta           home_season_avg_opp_stl - away_season_avg_opp_stl
+last10_<stat>_delta     home_last10_avg_<stat> - away_last10_avg_<stat>  (23 stats, same set as season_avg_*)
+recent_form_5_delta     home_recent_form_5 - away_recent_form_5
+recent_form_10_delta    home_recent_form_10 - away_recent_form_10
+recent_form_15_delta    home_recent_form_15 - away_recent_form_15
+win_streak_delta        home_win_streak - away_win_streak
+h2h_delta               home_h2h_win_rate - away_h2h_win_rate
 
 Run from the project root::
 
@@ -67,11 +83,23 @@ from src.utils.io import MODELS_DIR, PROJECT_ROOT, read_processed, read_schedule
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
 
+# Stats for which both a season-to-date average and a 10-game rolling average
+# are computed in features.py.  Used to auto-generate _TEAM_FEATURE_COLS entries
+# and MODEL_FEATURES delta columns without listing them twice.
+_LAST10_STATS = [
+    "pts", "reb", "oreb", "ast", "stl", "blk", "tov", "pf", "fta",
+    "fg_pct", "fg3_pct", "ft_pct", "plus_minus",
+    "true_shooting_pct", "three_point_rate", "free_throw_rate", "oreb_pct_proxy",
+    "true_oreb_pct",
+    "opp_pts", "opp_oreb", "opp_oreb_pct", "opp_blk", "opp_stl",
+]
+
 _TEAM_FEATURE_COLS = [
     "elo_pre",
     "season_win_rate",
     "season_avg_pts",
     "season_avg_fg_pct",
+    "season_avg_fg3_pct",
     "season_avg_ast",
     "season_avg_reb",
     "season_avg_oreb",
@@ -81,29 +109,31 @@ _TEAM_FEATURE_COLS = [
     "season_avg_pf",
     "season_avg_fta",
     "season_avg_ft_pct",
-    "season_avg_plus_minus",
+    "season_avg_true_shooting_pct",
+    "season_avg_three_point_rate",
+    "season_avg_free_throw_rate",
+    "season_avg_oreb_pct_proxy",
+    "season_avg_true_oreb_pct",
+    "season_avg_opp_pts",
+    "season_avg_opp_oreb",
+    "season_avg_opp_oreb_pct",
+    "season_avg_opp_blk",
+    "season_avg_opp_stl",
+    "recent_form_5",
+    "recent_form_10",
+    "recent_form_15",
+    "win_streak",
+    "h2h_win_rate",
     "team_fatigue",
     "team_acwr",
-]
+] + [f"last10_avg_{c}" for c in _LAST10_STATS]
 
 MODEL_FEATURES = [
     "elo_delta",
     "home_adv",
-    "win_rate_delta",
-    "pts_delta",
-    "fg_pct_delta",
     "fatigue_delta",
     "acwr_delta",
-    "ast_delta",
-    "reb_delta",
-    "oreb_delta",
-    "blk_delta",
-    "stl_delta",
-    "tov_delta",
-    "pf_delta",
-    "fta_delta",
-    "ft_pct_delta",
-    "plus_minus_delta",
+    "h2h_delta",
 ]
 
 
@@ -166,6 +196,7 @@ def compute_deltas(games: pd.DataFrame) -> pd.DataFrame:
     games["win_rate_delta"] = games["home_season_win_rate"] - games["away_season_win_rate"]
     games["pts_delta"] = games["home_season_avg_pts"] - games["away_season_avg_pts"]
     games["fg_pct_delta"] = games["home_season_avg_fg_pct"] - games["away_season_avg_fg_pct"]
+    games["fg3_pct_delta"] = games["home_season_avg_fg3_pct"] - games["away_season_avg_fg3_pct"]
     games["fatigue_delta"] = games["home_team_fatigue"] - games["away_team_fatigue"]
     games["acwr_delta"] = games["home_team_acwr"] - games["away_team_acwr"]
     games["ast_delta"] = games["home_season_avg_ast"] - games["away_season_avg_ast"]
@@ -177,7 +208,23 @@ def compute_deltas(games: pd.DataFrame) -> pd.DataFrame:
     games["pf_delta"] = games["home_season_avg_pf"] - games["away_season_avg_pf"]
     games["fta_delta"] = games["home_season_avg_fta"] - games["away_season_avg_fta"]
     games["ft_pct_delta"] = games["home_season_avg_ft_pct"] - games["away_season_avg_ft_pct"]
-    games["plus_minus_delta"] = games["home_season_avg_plus_minus"] - games["away_season_avg_plus_minus"]
+    games["true_shooting_pct_delta"] = games["home_season_avg_true_shooting_pct"] - games["away_season_avg_true_shooting_pct"]
+    games["three_point_rate_delta"] = games["home_season_avg_three_point_rate"] - games["away_season_avg_three_point_rate"]
+    games["free_throw_rate_delta"] = games["home_season_avg_free_throw_rate"] - games["away_season_avg_free_throw_rate"]
+    games["oreb_pct_proxy_delta"] = games["home_season_avg_oreb_pct_proxy"] - games["away_season_avg_oreb_pct_proxy"]
+    games["true_oreb_pct_delta"] = games["home_season_avg_true_oreb_pct"] - games["away_season_avg_true_oreb_pct"]
+    games["opp_pts_delta"] = games["home_season_avg_opp_pts"] - games["away_season_avg_opp_pts"]
+    games["opp_oreb_delta"] = games["home_season_avg_opp_oreb"] - games["away_season_avg_opp_oreb"]
+    games["opp_oreb_pct_delta"] = games["home_season_avg_opp_oreb_pct"] - games["away_season_avg_opp_oreb_pct"]
+    games["opp_blk_delta"] = games["home_season_avg_opp_blk"] - games["away_season_avg_opp_blk"]
+    games["opp_stl_delta"] = games["home_season_avg_opp_stl"] - games["away_season_avg_opp_stl"]
+    games["recent_form_5_delta"] = games["home_recent_form_5"] - games["away_recent_form_5"]
+    games["recent_form_10_delta"] = games["home_recent_form_10"] - games["away_recent_form_10"]
+    games["recent_form_15_delta"] = games["home_recent_form_15"] - games["away_recent_form_15"]
+    games["win_streak_delta"] = games["home_win_streak"] - games["away_win_streak"]
+    games["h2h_delta"] = games["home_h2h_win_rate"] - games["away_h2h_win_rate"]
+    for col in _LAST10_STATS:
+        games[f"last10_{col}_delta"] = games[f"home_last10_avg_{col}"] - games[f"away_last10_avg_{col}"]
     return games
 
 
@@ -190,11 +237,22 @@ def drop_missing(games: pd.DataFrame) -> pd.DataFrame:
     usually means upstream data is missing.
     """
     before = len(games)
-    games = games.dropna(subset=MODEL_FEATURES + ["home_win"]).copy()
-    dropped = before - len(games)
+    nan_mask = games[MODEL_FEATURES + ["home_win"]].isna().any(axis=1)
+    dropped = nan_mask.sum()
     if dropped:
-        log.info("drop_missing: dropped %d of %d game rows with NaN features.", dropped, before)
-    return games
+        nan_counts = (
+            games.loc[nan_mask, MODEL_FEATURES]
+            .isna().sum()
+            .pipe(lambda s: s[s > 0])
+            .sort_values(ascending=False)
+        )
+        log.info(
+            "drop_missing: dropped %d of %d game rows with NaN features.\n"
+            "  NaN counts per feature (top culprits):\n%s",
+            dropped, before,
+            "\n".join(f"    {col}: {n}" for col, n in nan_counts.items()),
+        )
+    return games[~nan_mask].copy()
 
 
 # ---------------------------------------------------------------------------
@@ -208,7 +266,7 @@ def train_model(train: pd.DataFrame) -> Pipeline:
 
     pipeline = Pipeline([
         ("scaler", StandardScaler()),
-        ("clf", LogisticRegression(max_iter=1000, random_state=42)),
+        ("clf", LogisticRegression(max_iter=1500, random_state=42)),
     ])
     pipeline.fit(X_train, y_train)
     return pipeline

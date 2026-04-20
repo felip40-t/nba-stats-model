@@ -82,7 +82,8 @@ python src/models/train.py --min-train-games 100
 2. **Processing** (`src/data/process.py`) — Cleans and restructures raw files into three interim tables in `data/<SEASON>/interim/`: `game_log.parquet` (team-per-game with `is_home`, `win`, `is_back_to_back`, `num_ot` flags), `player_game_log.parquet` (player-per-game with `minutes_decimal`), `team_advanced.parquet` (aggregated team totals + TS%, 3P rate, FT rate, OREB%). `num_ot` is derived from summed player-minutes: regulation = 240 per team, each OT adds 25. Pass `--playoffs` to process the `_playoffs` raw files and write `_playoffs` interim files.
 3. **Feature engineering** (`src/data/features.py`) — Reads interim tables and produces `team_features.parquet`, `player_features.parquet`, and `elo_ratings.parquet` in `data/<SEASON>/processed/`. Also computes per-team Elo ratings (`elo_pre`, `elo_post`, `home_adv`) and team-level fatigue aggregates (`team_fatigue`, `team_acwr`). Exposes `compute_features_from_data()` for in-memory computation with an optional `cutoff_date`; disk writes only happen when run directly. Pass `--playoffs` to load `*_playoffs.parquet` interim files alongside the regular-season tables; regular-season data is always included so Elo ratings carry over and rolling averages are not cold-started.
 4. **Training** (`src/models/train.py`) — Loads the full processed feature snapshot from disk once, then for each game date `d`: trains on all complete rows with `game_date < d`, predicts all games on `d`. Feature leakage is prevented by the `shift(1).expanding()` encoding already baked into the parquet — no per-iteration recompute is needed. Dates with fewer than `min_train_games` (default 50) complete rows are skipped (cold-start). Saves `outputs/models/win_probability_logreg.joblib` and `outputs/models/rolling_predictions.parquet`.
-5. **Evaluation** (`src/models/evaluate.py`) — Loads saved model and rolling predictions; prints log-loss, Brier score, and accuracy; saves nine diagnostic plots to `outputs/figures/`.
+5. **Elo grid search** (`src/models/elo_grid_search.py`) — Optional standalone script. Simulates Elo ratings across a multi-dimensional grid (`k`, `home_adv_base`, `home_adv_scale`, `home_adv_min`, `mov_baseline`, `ot_discount`, `carryover`, `inv_scale`) and evaluates each combination by log-loss against home outcomes. Saves results to `outputs/models/elo_grid_search_results.parquet` and prints the top 10 combinations.
+6. **Evaluation** (`src/models/evaluate.py`) — Loads saved model and rolling predictions; prints log-loss, Brier score, and accuracy; saves nine diagnostic plots to `outputs/figures/`.
 
 ### I/O and path resolution (`src/utils/io.py`)
 
@@ -104,15 +105,19 @@ Always use the `src/utils/io.py` helpers rather than calling `pd.read_parquet` /
 
 **Elo home-court advantage:** Only the home team's row carries `home_adv` (the away team's field is `None` in the raw Elo output). The value is team-specific: `max(ELO_HOME_ADV_MIN, ELO_HOME_ADV_BASE + (home_win_rate − 0.5) × ELO_HOME_ADV_SCALE)`.
 
+**Prior-season Elo carry-over:** `_load_prior_season_elo(carryover=0.5)` in `features.py` reads the prior season's final Elo ratings from `data/<SEASON-1>/processed/` (prefers `elo_ratings_playoffs.parquet`, falls back to `elo_ratings.parquet`) and regresses each team's rating 50% toward 1500. This is called automatically by `run_pipeline()` and passed to `compute_elo_ratings()` via `initial_ratings`. Teams not found in the prior snapshot start at `ELO_INITIAL`.
+
 **CLI output:** `src/utils/display.py` exports `print_table(title, df)`, used by `features.py` to print interim DataFrames at the end of each stage when run directly.
 
 ### Model features (`src/models/train.py`)
 
-`build_game_rows()` pivots team features into one-row-per-game format using the schedule to identify home/away sides. `compute_deltas()` adds model input columns as home-minus-away differences. `drop_missing()` removes rows where any feature is NaN (expected for early-season games before rolling windows have enough history). The logistic regression trains on **home-minus-away deltas** for: `elo_delta`, `win_rate_delta`, `pts_delta`, `fg_pct_delta`, `fatigue_delta`, `acwr_delta`, `home_adv`, plus box-score deltas (`ast`, `reb`, `oreb`, `blk`, `stl`, `tov`, `pf`, `fta`, `ft_pct`, `plus_minus`). Only `elo_pre` (not `elo_post`) is used.
+`build_game_rows()` pivots team features into one-row-per-game format using the schedule to identify home/away sides. `compute_deltas()` adds **all** home-minus-away delta columns (season averages, efficiency, defensive, form, last-10 rolling — 50+ columns total). `drop_missing()` removes rows where any feature in `MODEL_FEATURES` is NaN. Only `elo_pre` (not `elo_post`) is used. The current `MODEL_FEATURES` list is intentionally short: `["elo_delta", "home_adv", "fatigue_delta", "acwr_delta", "h2h_delta"]` — the remaining deltas are computed and available in the game table but not currently passed to the model. Use `tests/feature_tests.py` to identify which additional features add signal before expanding `MODEL_FEATURES`.
 
 ### Tests (`tests/`)
 
-`conftest.py` adds the project root to `sys.path` so `src.*` imports work. All tests construct minimal DataFrames directly — there is no test data on disk and no I/O. `pyproject.toml` configures pytest (`testpaths = ["tests"]`, `addopts = "-ra -q"`) and ruff (line-length 100, `target-version = "py310"`).
+`conftest.py` adds the project root to `sys.path` so `src.*` imports work. All pytest smoke tests construct minimal DataFrames directly — there is no test data on disk and no I/O. `pyproject.toml` configures pytest (`testpaths = ["tests"]`, `python_files = ["test_*.py", "feature_tests.py"]`, `addopts = "-ra -q"`) and ruff (line-length 100, `target-version = "py310"`).
+
+`tests/feature_tests.py` contains four feature-analysis utilities (also discovered by pytest): `l1_regularisation_sweep`, `permutation_importance`, `ablation_test`, `vif_test`. Each accepts `(model, X, y)` and returns a structured result object. `run_all_feature_tests(model, X, y)` runs all four and returns a dict. `tests/model_tests.py` is a standalone script (not a pytest module) that loads the saved model from `outputs/models/`, reconstructs the game table, and runs all four analyses.
 
 ### Tunable constants
 
@@ -126,10 +131,12 @@ Always use the `src/utils/io.py` helpers rather than calling `pd.read_parquet` /
 | `COOLDOWN_SECONDS` | `src/data/fetch_games.py` | `30.0` s | Duration of each cooldown pause |
 | `FATIGUE_LAMBDA` | `src/data/features.py` | `0.2` | Decay rate for exponential fatigue model |
 | `ELO_INITIAL` | `src/data/features.py` | `1500.0` | Starting Elo rating for all teams |
-| `ELO_K` | `src/data/features.py` | `20.0` | Elo K-factor (update magnitude per game) |
-| `ELO_HOME_ADV_BASE` | `src/data/features.py` | `100.0` | Elo home-court bonus for a .500 home record |
+| `ELO_K` | `src/data/features.py` | `25.0` | Elo K-factor (update magnitude per game) |
+| `ELO_HOME_ADV_BASE` | `src/data/features.py` | `40.0` | Elo home-court bonus for a .500 home record |
+| `ELO_HOME_ADV_SCALE` | `src/data/features.py` | `10.0` | Sensitivity of home-court bonus to home win rate |
+| `ELO_HOME_ADV_MIN` | `src/data/features.py` | `20.0` | Floor for worst home-record teams |
 | `ELO_MOV_BASELINE` | `src/data/features.py` | `8.0` | Point margin yielding a MOV multiplier of 1.0 (≈ median NBA win margin) |
-| `ELO_OT_DISCOUNT` | `src/data/features.py` | `0.5` | K reduction per OT period: `ot_factor = 1 / (1 + num_ot × discount)` |
+| `ELO_OT_DISCOUNT` | `src/data/features.py` | `0.2` | K reduction per OT period: `ot_factor = 1 / (1 + num_ot × discount)` |
 | `min_train_games` | `src/models/train.py` | `50` | Minimum training rows before the rolling simulation starts predicting |
 
 ## Key Notes

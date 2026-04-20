@@ -48,39 +48,71 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 # Decay rate for the exponential fatigue model (per day).
-# At λ=0.2 a game played 5 days ago contributes e^(-1) ≈ 37% of its original load;
-# 10 days ago ≈ 14%.  Tune between 0.15 (slow decay) and 0.3 (fast decay).
-FATIGUE_LAMBDA: float = 0.2
+# At λ=0.25 a game played 5 days ago contributes e^(-0.25) ≈ 22% of its original load;
+# Tune between 0.15 (slow decay) and 0.3 (fast decay).
+FATIGUE_LAMBDA: float = 0.25
 
 # Elo rating constants.  Starting rating and K-factor are the classic defaults;
 # home-court advantage is team-specific, scaled from each team's season-to-date
-# home win rate.  All are placeholders — calibrate once we have full-season data.
+# home win rate.
 ELO_INITIAL: float = 1500.0
-ELO_K: float = 20.0
+ELO_K: float = 25.0
 # Home-court advantage is a linear function of the home team's home win rate:
 #   home_adv = HOME_ADV_BASE + (home_win_rate − 0.5) × HOME_ADV_SCALE
-# A .500 home record → 100 pts; 100% → 150 pts; 0% → 50 pts (floored by MIN).
-ELO_HOME_ADV_BASE: float = 100.0   # advantage for a team with .500 home record
-ELO_HOME_ADV_SCALE: float = 100.0  # sensitivity to home win rate
-ELO_HOME_ADV_MIN: float = 50.0     # floor: worst home team still gets this bonus
+# A .500 home record → 40 pts; 100% home record → 42.5 pts; 0% home record → 37.5 pts (floored by MIN=15).
+ELO_HOME_ADV_BASE: float = 40.0   # advantage for a team with .500 home record
+ELO_HOME_ADV_SCALE: float = 5.0  # sensitivity to home win rate
+ELO_HOME_ADV_MIN: float = 15.0     # floor: worst home team still gets this bonus
 # Margin-of-victory multiplier: effective K = K × log1p(|margin|)/log1p(MOV_BASELINE) × ot_factor
 # MOV_BASELINE is the point margin that yields a multiplier of exactly 1.0 (≈ median NBA win margin).
 ELO_MOV_BASELINE: float = 8.0
 # OT discount: ot_factor = 1 / (1 + num_ot × OT_DISCOUNT)
-# 0 OT → 1.0×  |  1 OT → 0.67×  |  2 OT → 0.50×  |  3 OT → 0.40×
-ELO_OT_DISCOUNT: float = 0.5
+ELO_OT_DISCOUNT: float = 0.1
 
 _HERE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_HERE_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_HERE_PROJECT_ROOT))
 
 from src.utils.display import print_table  # noqa: E402
-from src.utils.io import PROJECT_ROOT, read_interim, write_processed  # noqa: E402
+from src.utils.io import PROJECT_ROOT, SEASON, read_interim, read_parquet, write_processed  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Team features
 # ---------------------------------------------------------------------------
+
+def _load_prior_season_elo(carryover: float = 0.55) -> dict[int, float] | None:
+    """Load each team's final Elo from the prior season and regress toward 1500.
+
+    Prefers the playoffs snapshot (``elo_ratings_playoffs.parquet``) so carry-over
+    reflects the true end-of-season strength, falling back to the regular-season
+    snapshot when no playoff file exists.  Returns None if no prior data is found.
+
+    With ``carryover=0.55`` a team that finished at 1600 starts the new season at
+    1500 + 0.55 * (1600 - 1500) = 1555, carrying over 55% of the deviation.
+    """
+    prior_season = str(int(SEASON) - 1)
+    prior_dir = PROJECT_ROOT / "data" / prior_season / "processed"
+
+    for fname in ("elo_ratings_playoffs.parquet", "elo_ratings.parquet"):
+        path = prior_dir / fname
+        if path.exists():
+            elo_ts = read_parquet(path)
+            final = (
+                elo_ts.sort_values("game_date")
+                .groupby("team_id")["elo_post"]
+                .last()
+            )
+            regressed = ELO_INITIAL + (carryover) * (final - ELO_INITIAL)
+            log.info(
+                "_load_prior_season_elo: loaded %d team ratings from %s (carryover=%.0f%%)",
+                len(regressed), path.relative_to(PROJECT_ROOT), carryover * 100,
+            )
+            return regressed.to_dict()
+
+    log.info("_load_prior_season_elo: no prior-season Elo found in %s — using flat initial", prior_dir)
+    return None
+
 
 def compute_elo_ratings(
     game_log: pd.DataFrame,
@@ -91,6 +123,7 @@ def compute_elo_ratings(
     home_adv_min: float = ELO_HOME_ADV_MIN,
     mov_baseline: float = ELO_MOV_BASELINE,
     ot_discount: float = ELO_OT_DISCOUNT,
+    initial_ratings: dict[int, float] | None = None,
 ) -> pd.DataFrame:
     """Compute pre- and post-game Elo ratings for every team-game row.
 
@@ -132,6 +165,10 @@ def compute_elo_ratings(
         Point margin that yields a MOV multiplier of exactly 1.0.
     ot_discount:
         Fractional K reduction per overtime period.
+    initial_ratings:
+        Optional per-team starting ratings (keyed by ``team_id`` int).  Teams not
+        present fall back to ``initial``.  Pass the output of
+        ``_load_prior_season_elo()`` to carry over regressed end-of-season ratings.
 
     Returns
     -------
@@ -163,8 +200,9 @@ def compute_elo_ratings(
 
         h_id = int(home["team_id"])
         a_id = int(away["team_id"])
-        r_h = ratings.get(h_id, initial)
-        r_a = ratings.get(a_id, initial)
+        _fallback = initial_ratings or {}
+        r_h = ratings.get(h_id, _fallback.get(h_id, initial))
+        r_a = ratings.get(a_id, _fallback.get(a_id, initial))
 
         # Team-specific home advantage from prior home record (.500 prior for debut).
         h_played = home_games.get(h_id, 0)
@@ -209,15 +247,37 @@ def compute_elo_ratings(
 
     return pd.DataFrame.from_records(records)
 
+def _compute_win_streak(wins: pd.Series) -> pd.Series:
+    """Current win/loss streak entering each game.
+
+    Called via groupby("team_id")["win"].transform, so the series is already
+    sorted in chronological order within each team group.  Returns a float
+    Series (positive = win streak, negative = loss streak, 0 = no history).
+    """
+    out = np.zeros(len(wins))
+    streak = 0
+    for i, v in enumerate(wins):
+        out[i] = streak
+        if pd.isna(v):
+            streak = 0
+        elif int(v) == 1:
+            streak = streak + 1 if streak >= 0 else 1
+        else:
+            streak = streak - 1 if streak <= 0 else -1
+    return pd.Series(out, index=wins.index)
+
+
 def build_team_features(
     game_log: pd.DataFrame,
     team_advanced: pd.DataFrame,
+    initial_elo_ratings: dict[int, float] | None = None,
 ) -> pd.DataFrame:
     """Build team-level feature table with rolling season averages.
 
-    Merges ``game_log`` with the efficiency metrics from ``team_advanced``,
-    then computes expanding-window season averages (shift-by-1 so the current
-    game is excluded) for a set of box-score and efficiency columns.
+    Merges ``game_log`` with efficiency metrics from ``team_advanced``, attaches
+    opponent identity via self-join, then computes expanding-window season
+    averages (shift-by-1 so the current game is excluded) plus recent-form
+    windows, win/loss streak, and head-to-head win rate.
 
     Parameters
     ----------
@@ -231,7 +291,8 @@ def build_team_features(
     -------
     pd.DataFrame
         One row per team per game with original columns plus ``season_avg_*``,
-        ``season_win_rate``, and ``games_played`` features.
+        ``season_win_rate``, ``games_played``, ``recent_form_*``,
+        ``win_streak``, ``h2h_win_rate``, and Elo features.
     """
     adv_cols = [
         "game_id", "team_id",
@@ -243,20 +304,51 @@ def build_team_features(
         how="left",
     )
 
+    # --- Opponent identity and per-game opponent stats ----------------------
+    # Self-join game_log on game_id: each game has 2 rows, so every team row
+    # gets one opponent candidate; we keep only the non-self match.
+    opp = game_log[["game_id", "team_id", "dreb", "pts", "oreb", "blk", "stl"]].rename(
+        columns={
+            "team_id": "opp_team_id",
+            "dreb": "opp_dreb",
+            "pts": "opp_pts",
+            "oreb": "opp_oreb",
+            "blk": "opp_blk",
+            "stl": "opp_stl",
+        }
+    )
+    df = df.merge(opp, on="game_id", how="left")
+    df = df[df["team_id"] != df["opp_team_id"]].copy()
+
+    # Real OREB%: own offensive rebounds / (own OREB + opponent DREB)
+    df["true_oreb_pct"] = df["oreb"] / (df["oreb"] + df["opp_dreb"]).replace(0, np.nan)
+
+    # Opponent OREB%: opponent's offensive rebounds / (opp OREB + own DREB)
+    df["opp_oreb_pct"] = df["opp_oreb"] / (df["opp_oreb"] + df["dreb"]).replace(0, np.nan)
+
     df = df.sort_values(["team_id", "game_date"]).reset_index(drop=True)
 
-    # Columns to roll — box-score stats + efficiency metrics
+    # --- Rolling season averages (shift-1, prior games only) ---------------
     avg_cols = [
         "pts", "reb", "oreb", "ast", "stl", "blk", "tov", "pf", "fta",
         "fg_pct", "fg3_pct", "ft_pct", "plus_minus",
         "true_shooting_pct", "three_point_rate", "free_throw_rate", "oreb_pct_proxy",
+        "true_oreb_pct",
+        "opp_pts", "opp_oreb", "opp_oreb_pct", "opp_blk", "opp_stl",
     ]
-
     for col in avg_cols:
         if col in df.columns:
             df[f"season_avg_{col}"] = (
                 df.groupby("team_id")[col]
                 .transform(lambda s: s.shift(1).expanding().mean())
+            )
+
+    # --- Last-10-game rolling averages (shift-1, prior 10 games only) -------
+    for col in avg_cols:
+        if col in df.columns:
+            df[f"last10_avg_{col}"] = (
+                df.groupby("team_id")[col]
+                .transform(lambda s: s.shift(1).rolling(10, min_periods=1).mean())
             )
 
     # Season win rate before current game
@@ -271,18 +363,42 @@ def build_team_features(
         .transform(lambda s: s.shift(1).expanding().count())
     ).fillna(0).astype(int)
 
+    # --- Recent form: rolling win rate over last N games (shift-1) ---------
+    for n in [5, 10, 15]:
+        df[f"recent_form_{n}"] = (
+            df.groupby("team_id")["win"]
+            .transform(lambda s, _n=n: s.shift(1).rolling(_n, min_periods=1).mean())
+        )
+
+    # --- Win/loss streak entering each game --------------------------------
+    # df is sorted by [team_id, game_date] so each group is chronological.
+    df["win_streak"] = (
+        df.groupby("team_id")["win"]
+        .transform(_compute_win_streak)
+    )
+
+    # --- Head-to-head win rate vs this specific opponent (shift-1) ---------
+    h2h_sorted = df.sort_values(["team_id", "opp_team_id", "game_date"])
+    h2h_rates = (
+        h2h_sorted.groupby(["team_id", "opp_team_id"])["win"]
+        .transform(lambda s: s.shift(1).expanding().mean())
+    )
+    # No prior h2h history → 0.5 (assume parity; win_rate_delta already captures
+    # overall quality, so h2h_delta=0 correctly signals no matchup-specific edge).
+    df["h2h_win_rate"] = h2h_rates.fillna(0.5)
+
     # --- Elo ratings --------------------------------------------------------
-    # Merge the team's own pre/post Elo, then self-join on game_id to attach
-    # the opponent's pre-game Elo (useful for win-probability modelling).
-    elo = compute_elo_ratings(game_log)
+    elo = compute_elo_ratings(game_log, initial_ratings=initial_elo_ratings)
     elo_merge = elo.drop(columns=["game_date"], errors="ignore")
     df = df.merge(elo_merge, on=["game_id", "team_id"], how="left")
 
-    opp_elo = elo_merge.rename(
+    # Attach opponent pre-game Elo using the already-joined opp_team_id.
+    opp_elo = elo_merge[["game_id", "team_id", "elo_pre"]].rename(
         columns={"team_id": "opp_team_id", "elo_pre": "opp_elo_pre"}
-    )[["game_id", "opp_team_id", "opp_elo_pre"]]
-    df = df.merge(opp_elo, on="game_id", how="left")
-    df = df[df["team_id"] != df["opp_team_id"]].drop(columns=["opp_team_id"])
+    )
+    df = df.merge(opp_elo, on=["game_id", "opp_team_id"], how="left")
+
+    df = df.drop(columns=["opp_team_id", "opp_dreb", "opp_pts", "opp_oreb", "opp_blk", "opp_stl"], errors="ignore")
 
     return df.sort_values(["game_date", "game_id", "team_id"]).reset_index(drop=True)
 
@@ -488,6 +604,7 @@ def compute_features_from_data(
     player_game_log: pd.DataFrame,
     team_advanced: pd.DataFrame,
     cutoff_date=None,
+    initial_elo_ratings: dict[int, float] | None = None,
 ) -> dict[str, pd.DataFrame]:
     """Compute team and player features from pre-loaded interim tables.
 
@@ -515,7 +632,7 @@ def compute_features_from_data(
         valid_ids = set(game_log["game_id"])
         player_game_log = player_game_log[player_game_log["game_id"].isin(valid_ids)].copy()
 
-    team_features = build_team_features(game_log, team_advanced)
+    team_features = build_team_features(game_log, team_advanced, initial_elo_ratings=initial_elo_ratings)
     player_features = build_player_features(player_game_log, game_log)
     team_player_feats = build_team_player_features(player_features)
     team_features = team_features.merge(team_player_feats, on=["game_id", "team_id"], how="left")
@@ -583,7 +700,14 @@ def run_pipeline(
         print(f"  player_game_log  : {player_game_log.shape[0]} rows, {player_game_log.shape[1]} cols")
         print(f"  team_advanced    : {team_advanced.shape[0]} rows, {team_advanced.shape[1]} cols")
 
-    outputs = compute_features_from_data(game_log, player_game_log, team_advanced, cutoff_date)
+    prior_elo = _load_prior_season_elo()
+    if verbose and prior_elo:
+        print(f"  prior-season Elo : loaded {len(prior_elo)} team ratings (45% regression toward 1500)")
+
+    outputs = compute_features_from_data(
+        game_log, player_game_log, team_advanced, cutoff_date,
+        initial_elo_ratings=prior_elo,
+    )
 
     if playoffs and playoff_game_ids is not None:
         outputs["team_features"] = (
