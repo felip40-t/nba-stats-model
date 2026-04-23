@@ -141,14 +141,14 @@ MODEL_FEATURES = [
 ]
 
 XGBOOST_DEFAULT_PARAMS: dict = {
-    "n_estimators": 300,
-    "max_depth": 4,
-    "learning_rate": 0.05,
+    "n_estimators": 100,
+    "max_depth": 3,
+    "learning_rate": 0.03,
     "subsample": 0.8,
-    "colsample_bytree": 0.8,
+    "colsample_bytree": 0.7,
     "min_child_weight": 5,
     "gamma": 0.1,
-    "reg_alpha": 0.1,
+    "reg_alpha": 0.0,
     "reg_lambda": 1.0,
     "objective": "binary:logistic",
     "eval_metric": "logloss",
