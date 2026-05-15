@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "nba-stats-model"
-version = "2.1.0"
+version = "2.4.0"
 description = "NBA win-probability model — ingestion, feature engineering, training, evaluation."
 readme = "README.md"
 requires-python = ">=3.10"

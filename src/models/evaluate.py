@@ -29,8 +29,9 @@ Run from the project root::
 from __future__ import annotations
 
 import argparse
-import logging
+import json
 import sys
+from datetime import date
 from pathlib import Path
 
 import joblib
@@ -44,46 +45,14 @@ _HERE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_HERE_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_HERE_PROJECT_ROOT))
 
-from src.utils.io import FIGURES_DIR, MODELS_DIR, PROJECT_ROOT, read_processed  # noqa: E402
-from src.models.train import MODEL_FEATURES  # noqa: E402
+from src.utils.io import FIGURES_DIR, MODELS_DIR, PROJECT_ROOT, SEASON, configure_logging, read_parquet, read_processed, season_api  # noqa: E402
+from src.utils.style import PANEL, TEXT, GRID, BLUE, RED, NBA_TEAM_COLORS, style_ax, legend, styled_subplots, save_fig  # noqa: E402
+from src.models.train import MODEL_FEATURES, XGBOOST_MODEL_FEATURES  # noqa: E402
 
 FIGURES_LOGREG_DIR  = FIGURES_DIR / "logreg"
 FIGURES_XGBOOST_DIR = FIGURES_DIR / "xgboost"
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
-log = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Dark theme constants
-# ---------------------------------------------------------------------------
-
-BG    = "#131722"
-PANEL = "#1e222d"
-TEXT  = "#d1d4dc"
-GRID  = "#2a2e39"
-BLUE  = "#2962ff"
-RED   = "#ff3c00"
-
-
-def _style_ax(ax) -> None:
-    ax.set_facecolor(PANEL)
-    for spine in ax.spines.values():
-        spine.set_edgecolor(GRID)
-    ax.tick_params(colors=TEXT, labelsize=9, length=0)
-    ax.grid(which="major", color=GRID, linewidth=0.6, linestyle="-", zorder=1)
-    ax.set_axisbelow(True)
-
-
-def _style_fig(fig) -> None:
-    fig.patch.set_facecolor(BG)
-
-
-def _legend(ax, **kwargs):
-    ax.legend(
-        frameon=True, facecolor=PANEL, edgecolor=GRID,
-        labelcolor=TEXT, fontsize=9,
-        **kwargs,
-    )
+log = configure_logging("evaluate")
 
 
 # ---------------------------------------------------------------------------
@@ -126,9 +95,7 @@ def plot_calibration_curve(
 
     non_empty = bucket_count > 0
 
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
-    _style_fig(fig)
-    _style_ax(ax)
+    fig, ax = styled_subplots((6, 6))
 
     ax.plot([0, 1], [0, 1], color=TEXT, linewidth=1, linestyle="--", label="Perfect calibration")
     sc = ax.scatter(
@@ -151,13 +118,11 @@ def plot_calibration_curve(
     ax.set_ylabel("Actual win rate", color=TEXT, fontsize=9, labelpad=8)
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
-    _legend(ax, loc="upper left")
+    legend(ax, loc="upper left")
     fig.suptitle("Calibration curve", color=TEXT, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
+    save_fig(fig, out_path)
     log.info("Calibration curve → %s", out_path.relative_to(PROJECT_ROOT))
 
 
@@ -178,9 +143,7 @@ def plot_feature_coefficients(
 
     colors = [RED if c < 0 else BLUE for c in sorted_coefs]
 
-    fig, ax = plt.subplots(figsize=(7, max(3, 0.5 * len(MODEL_FEATURES))), dpi=150)
-    _style_fig(fig)
-    _style_ax(ax)
+    fig, ax = styled_subplots((7, max(3, 0.5 * len(MODEL_FEATURES))))
 
     ax.barh(sorted_features[::-1], sorted_coefs[::-1], color=colors[::-1], zorder=2)
     ax.axvline(0, color=TEXT, linewidth=0.8)
@@ -188,9 +151,7 @@ def plot_feature_coefficients(
     fig.suptitle("Logistic regression feature coefficients", color=TEXT, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
+    save_fig(fig, out_path)
     log.info("Feature coefficients → %s", out_path.relative_to(PROJECT_ROOT))
 
 
@@ -201,21 +162,17 @@ def plot_feature_importance(
     importances = model.feature_importances_
 
     order           = np.argsort(importances)[::-1]
-    sorted_features = [MODEL_FEATURES[i] for i in order]
+    sorted_features = [XGBOOST_MODEL_FEATURES[i] for i in order]
     sorted_imps     = importances[order]
 
-    fig, ax = plt.subplots(figsize=(7, max(3, 0.5 * len(MODEL_FEATURES))), dpi=150)
-    _style_fig(fig)
-    _style_ax(ax)
+    fig, ax = styled_subplots((7, max(5, 0.35 * len(XGBOOST_MODEL_FEATURES))))
 
     ax.barh(sorted_features[::-1], sorted_imps[::-1], color=BLUE, zorder=2)
     ax.set_xlabel("Feature importance (gain)", color=TEXT, fontsize=9, labelpad=8)
     fig.suptitle("XGBoost feature importance", color=TEXT, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
+    save_fig(fig, out_path)
     log.info("Feature importance → %s", out_path.relative_to(PROJECT_ROOT))
 
 
@@ -241,14 +198,13 @@ def plot_elo_time_series(
     ncols = 6
     nrows = (len(teams) + ncols - 1) // ncols
 
-    fig, axes = plt.subplots(nrows, ncols, figsize=(18, nrows * 3), sharey=False, dpi=150)
-    _style_fig(fig)
+    fig, axes = styled_subplots((18, nrows * 3), nrows=nrows, ncols=ncols, sharey=False)
     axes = axes.flatten()
 
     for i, team in enumerate(teams):
         ax   = axes[i]
         data = elo[elo["team_abbreviation"] == team].sort_values("game_date")
-        _style_ax(ax)
+        style_ax(ax)
         ax.plot(data["game_date"], data["elo_pre"], linewidth=1.4, color=BLUE, zorder=2)
         ax.axhline(1500, color=GRID, linewidth=0.9, linestyle="--")
         ax.set_title(team, fontsize=9, fontweight="bold", color=TEXT)
@@ -260,14 +216,12 @@ def plot_elo_time_series(
         axes[j].set_visible(False)
 
     fig.suptitle(
-        "Elo rating progression — 2024-25 NBA regular season",
+        f"Elo rating progression — {season_api(SEASON)} NBA regular season",
         color=TEXT, fontsize=13, x=0.01, ha="left",
     )
     fig.tight_layout()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
+    save_fig(fig, out_path)
     log.info("Elo time series → %s", out_path.relative_to(PROJECT_ROOT))
 
 
@@ -279,8 +233,9 @@ def plot_elo_all_teams(
     elo_ratings: pd.DataFrame,
     team_features: pd.DataFrame,
     out_path: Path = FIGURES_DIR / "elo_all_teams.png",
+    top_n: int = 10,
 ) -> None:
-    """All 30 teams' Elo ratings on a single axes, colour-coded by team."""
+    """Top-N teams by final Elo rating on a single axes, coloured by franchise."""
     abbrev_map = (
         team_features[["team_id", "team_abbreviation"]]
         .drop_duplicates()
@@ -290,28 +245,49 @@ def plot_elo_all_teams(
     elo["team_abbreviation"] = elo["team_id"].map(abbrev_map)
     elo["game_date"] = pd.to_datetime(elo["game_date"])
 
-    teams = sorted(elo["team_abbreviation"].dropna().unique())
-    n = len(teams)
+    # Rank all teams by their final elo_pre and keep only the top N.
+    final_elo_by_team = (
+        elo.dropna(subset=["elo_pre"])
+        .sort_values("game_date")
+        .groupby("team_abbreviation")["elo_pre"]
+        .last()
+        .sort_values(ascending=False)
+    )
+    top_teams = final_elo_by_team.index[:top_n].tolist()
+    elo = elo[elo["team_abbreviation"].isin(top_teams)]
 
-    # Build a 30-colour palette from tab20 + tab20b
-    tab20  = plt.cm.tab20.colors   # type: ignore[attr-defined]
-    tab20b = plt.cm.tab20b.colors  # type: ignore[attr-defined]
-    palette = list(tab20) + list(tab20b)
-    team_colors = {team: palette[i % len(palette)] for i, team in enumerate(teams)}
+    fig, ax = styled_subplots((13, 6))
 
-    fig, ax = plt.subplots(figsize=(16, 7), dpi=150)
-    _style_fig(fig)
-    _style_ax(ax)
-
-    for team in teams:
+    final_elos: dict[str, tuple] = {}
+    for team in top_teams:
         data = elo[elo["team_abbreviation"] == team].sort_values("game_date")
+        color = NBA_TEAM_COLORS.get(team, BLUE)
         ax.plot(
             data["game_date"], data["elo_pre"],
-            linewidth=1.0, alpha=0.85,
-            color=team_colors[team],
+            linewidth=1.8, alpha=0.9,
+            color=color,
             label=team,
             zorder=2,
         )
+        if not data.empty:
+            final_elos[team] = (data["game_date"].iloc[-1], data["elo_pre"].iloc[-1])
+
+    # Label every plotted team at the end of its line.
+    label_offset = pd.Timedelta(days=3)
+    for team in top_teams:
+        x, y = final_elos[team]
+        ax.text(
+            x + label_offset, y, team,
+            color=NBA_TEAM_COLORS.get(team, BLUE),
+            fontsize=8, fontweight="bold",
+            va="center", ha="left",
+            clip_on=False,
+            zorder=4,
+        )
+
+    # Extend x-axis right margin to fit end labels.
+    x_min, x_max = ax.get_xlim()
+    ax.set_xlim(x_min, x_max + 18)
 
     ax.axhline(1500, color=TEXT, linewidth=0.7, linestyle="--", alpha=0.4, zorder=1)
 
@@ -324,24 +300,21 @@ def plot_elo_all_teams(
     ax.set_xlabel("Date", color=TEXT, fontsize=9, labelpad=8)
     ax.set_ylabel("Elo rating", color=TEXT, fontsize=9, labelpad=8)
 
-    # Legend outside the axes in 3 columns to fit 30 teams
-    leg = ax.legend(
+    ax.legend(
         frameon=True, facecolor=PANEL, edgecolor=GRID,
-        labelcolor=TEXT, fontsize=7,
-        ncol=3, loc="upper left",
-        bbox_to_anchor=(1.01, 1), borderaxespad=0,
+        labelcolor=TEXT, fontsize=8,
+        ncol=2, loc="upper left",
+        bbox_to_anchor=(0.01, 0.99), borderaxespad=0,
     )
 
     fig.suptitle(
-        "Elo ratings — all teams — 2024-25 NBA regular season",
+        f"Elo ratings — top {top_n} teams — {season_api(SEASON)} NBA regular season",
         color=TEXT, fontsize=13, x=0.01, ha="left",
     )
     fig.tight_layout()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
-    log.info("Elo all teams → %s", out_path.relative_to(PROJECT_ROOT))
+    save_fig(fig, out_path)
+    log.info("Elo top-%d teams → %s", top_n, out_path.relative_to(PROJECT_ROOT))
 
 
 # ---------------------------------------------------------------------------
@@ -364,9 +337,7 @@ def plot_rolling_accuracy(
     df["rolling_acc"] = df["correct"].rolling(window, min_periods=max(1, window // 2)).mean()
     season_mean = df["correct"].mean()
 
-    fig, ax = plt.subplots(figsize=(13, 5), dpi=150)
-    _style_fig(fig)
-    _style_ax(ax)
+    fig, ax = styled_subplots((13, 5))
 
     ax.bar(
         weekly["week"], weekly["mean"],
@@ -389,13 +360,11 @@ def plot_rolling_accuracy(
     ax.set_ylim(0, 1)
     ax.set_xlabel("Date", color=TEXT, fontsize=9, labelpad=8)
     ax.set_ylabel("Accuracy", color=TEXT, fontsize=9, labelpad=8)
-    _legend(ax, loc="lower right")
+    legend(ax, loc="lower right")
     fig.suptitle("Prediction accuracy throughout the season", color=TEXT, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
+    save_fig(fig, out_path)
     log.info("Rolling accuracy → %s", out_path.relative_to(PROJECT_ROOT))
 
 
@@ -411,9 +380,7 @@ def plot_roc_curve(
     fpr, tpr, _ = roc_curve(y_true, y_proba)
     auc = roc_auc_score(y_true, y_proba)
 
-    fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
-    _style_fig(fig)
-    _style_ax(ax)
+    fig, ax = styled_subplots((6, 6))
 
     ax.plot(fpr, tpr, color=BLUE, linewidth=1.8, label=f"AUC = {auc:.4f}", zorder=3)
     ax.plot([0, 1], [0, 1], color=TEXT, linewidth=1, linestyle="--", label="Random classifier", zorder=2)
@@ -421,13 +388,11 @@ def plot_roc_curve(
 
     ax.set_xlabel("False positive rate", color=TEXT, fontsize=9, labelpad=8)
     ax.set_ylabel("True positive rate", color=TEXT, fontsize=9, labelpad=8)
-    _legend(ax, loc="lower right")
+    legend(ax, loc="lower right")
     fig.suptitle("ROC curve", color=TEXT, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
+    save_fig(fig, out_path)
     log.info("ROC curve → %s", out_path.relative_to(PROJECT_ROOT))
 
 
@@ -446,9 +411,7 @@ def plot_confidence_histogram(
     losses = y_proba[y_true_arr == 0]
     bins   = np.linspace(0, 1, n_bins + 1)
 
-    fig, ax = plt.subplots(figsize=(8, 4), dpi=150)
-    _style_fig(fig)
-    _style_ax(ax)
+    fig, ax = styled_subplots((8, 4))
 
     ax.hist(wins,   bins=bins, alpha=0.55, color=BLUE, label="Home win",  zorder=2)
     ax.hist(losses, bins=bins, alpha=0.55, color=RED,  label="Home loss", zorder=2)
@@ -456,16 +419,14 @@ def plot_confidence_histogram(
 
     ax.set_xlabel("Predicted home-win probability", color=TEXT, fontsize=9, labelpad=8)
     ax.set_ylabel("Games", color=TEXT, fontsize=9, labelpad=8)
-    _legend(ax)
+    legend(ax)
     fig.suptitle(
         "Distribution of predicted probabilities by actual outcome",
         color=TEXT, fontsize=12, x=0.01, ha="left",
     )
     fig.tight_layout()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
+    save_fig(fig, out_path)
     log.info("Confidence histogram → %s", out_path.relative_to(PROJECT_ROOT))
 
 
@@ -491,9 +452,7 @@ def plot_accuracy_by_confidence(
         accs.append(correct[mask].mean() if mask.sum() > 0 else np.nan)
         counts.append(mask.sum())
 
-    fig, ax1 = plt.subplots(figsize=(10, 4), dpi=150)
-    _style_fig(fig)
-    _style_ax(ax1)
+    fig, ax1 = styled_subplots((10, 4))
 
     ax2 = ax1.twinx()
     ax2.set_facecolor(PANEL)
@@ -521,9 +480,7 @@ def plot_accuracy_by_confidence(
     fig.suptitle("Accuracy by model confidence band", color=TEXT, fontsize=12, x=0.01, ha="left")
     fig.tight_layout()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
+    save_fig(fig, out_path)
     log.info("Accuracy by confidence → %s", out_path.relative_to(PROJECT_ROOT))
 
 
@@ -560,9 +517,7 @@ def plot_team_accuracy(
     overall = preds["correct"].mean()
     colors  = [BLUE if a >= overall else RED for a in team_acc["accuracy"]]
 
-    fig, ax = plt.subplots(figsize=(14, 5), dpi=150)
-    _style_fig(fig)
-    _style_ax(ax)
+    fig, ax = styled_subplots((14, 5))
 
     ax.bar(team_acc["team"], team_acc["accuracy"], color=colors, zorder=2)
     ax.axhline(overall, color=TEXT, linewidth=1, linestyle="--",
@@ -572,16 +527,14 @@ def plot_team_accuracy(
     ax.set_ylabel("Accuracy", color=TEXT, fontsize=9, labelpad=8)
     ax.set_ylim(0, 1)
     ax.tick_params(axis="x", rotation=45)
-    _legend(ax)
+    legend(ax)
     fig.suptitle(
         "Per-team prediction accuracy (home + away games combined)",
         color=TEXT, fontsize=12, x=0.01, ha="left",
     )
     fig.tight_layout()
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150, bbox_inches="tight", facecolor=BG)
-    plt.close(fig)
+    save_fig(fig, out_path)
     log.info("Team accuracy → %s", out_path.relative_to(PROJECT_ROOT))
 
 
@@ -596,6 +549,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["logreg", "xgboost"],
         default="logreg",
         help="Model type to evaluate (default: logreg).",
+    )
+    p.add_argument(
+        "--output-json",
+        action="store_true",
+        default=False,
+        help="Write metrics to outputs/models/latest_metrics.json.",
     )
     return p.parse_args(argv)
 
@@ -612,7 +571,7 @@ def main(argv: list[str] | None = None) -> None:
     model = joblib.load(model_path)
 
     log.info("Loading rolling predictions from %s ...", pred_path.relative_to(PROJECT_ROOT))
-    preds = pd.read_parquet(pred_path)
+    preds = read_parquet(pred_path)
 
     log.info("Loading processed features ...")
     team_features = read_processed("team_features.parquet")
@@ -623,6 +582,19 @@ def main(argv: list[str] | None = None) -> None:
     y_pred  = preds["predicted_label"].values
 
     print_metrics(y_true, y_proba, y_pred)
+
+    if args.output_json:
+        metrics = {
+            "date": date.today().isoformat(),
+            "model": model_name,
+            "log_loss": float(log_loss(y_true, y_proba)),
+            "brier": float(brier_score_loss(y_true, y_proba)),
+            "accuracy": float(accuracy_score(y_true, y_pred)),
+        }
+        out_path = MODELS_DIR / "latest_metrics.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(json.dumps(metrics, indent=2))
+        log.info("Metrics JSON → %s", out_path.relative_to(PROJECT_ROOT))
 
     if model_name == "logreg":
         plot_feature_coefficients(model, out_path=fig_dir / "feature_coefficients.png")

@@ -29,6 +29,7 @@ with ``python src/data/fetch_games.py --playoffs``::
 from __future__ import annotations
 
 import argparse
+import logging
 import re
 import sys
 from pathlib import Path
@@ -43,7 +44,9 @@ if str(_HERE_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_HERE_PROJECT_ROOT))
 
 from src.utils.display import print_table  # noqa: E402
-from src.utils.io import PROJECT_ROOT, read_raw, write_interim  # noqa: E402
+from src.utils.io import PROJECT_ROOT, configure_logging, read_raw, write_interim  # noqa: E402
+
+log = configure_logging("process")
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +84,14 @@ def _parse_minutes(minutes_str: pd.Series) -> pd.Series:
     return minutes_str.apply(_convert_minutes)
 
 
+def _coerce_cols(df: pd.DataFrame, cols: list[str], dtype: str | None = None) -> None:
+    """Cast columns to dtype in-place via pd.to_numeric, skipping missing columns."""
+    for col in cols:
+        if col in df.columns:
+            s = pd.to_numeric(df[col], errors="coerce")
+            df[col] = s.astype(dtype) if dtype is not None else s
+
+
 # ---------------------------------------------------------------------------
 # game_log
 # ---------------------------------------------------------------------------
@@ -112,17 +123,10 @@ def clean_game_log(df: pd.DataFrame) -> pd.DataFrame:
     df["game_date"] = pd.to_datetime(df["game_date"])
     df["team_id"] = df["team_id"].astype("Int64")
 
-    int_cols = ["fgm", "fga", "fg3m", "fg3a", "ftm", "fta",
-                "oreb", "dreb", "reb", "ast", "stl", "blk",
-                "tov", "pf", "pts", "plus_minus", "min"]
-    for col in int_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
-
-    float_cols = ["fg_pct", "fg3_pct", "ft_pct"]
-    for col in float_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    _coerce_cols(df, ["fgm", "fga", "fg3m", "fg3a", "ftm", "fta",
+                      "oreb", "dreb", "reb", "ast", "stl", "blk",
+                      "tov", "pf", "pts", "plus_minus", "min"], "Int64")
+    _coerce_cols(df, ["fg_pct", "fg3_pct", "ft_pct"])
 
     # --- drop uninformative columns -----------------------------------------
     df = df.drop(columns=["video_available"], errors="ignore")
@@ -229,20 +233,13 @@ def clean_player_game_log(df: pd.DataFrame) -> pd.DataFrame:
     df["person_id"] = pd.to_numeric(df["person_id"], errors="coerce").astype("Int64")
     df["minutes_decimal"] = _parse_minutes(df["minutes"])
 
-    int_cols = ["field_goals_made", "field_goals_attempted",
-                "three_pointers_made", "three_pointers_attempted",
-                "free_throws_made", "free_throws_attempted",
-                "rebounds_offensive", "rebounds_defensive", "rebounds_total",
-                "assists", "steals", "blocks", "turnovers", "fouls_personal", "points"]
-    for col in int_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").astype("Int64")
-
-    float_cols = ["field_goals_percentage", "three_pointers_percentage",
-                  "free_throws_percentage", "plus_minus_points"]
-    for col in float_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    _coerce_cols(df, ["field_goals_made", "field_goals_attempted",
+                      "three_pointers_made", "three_pointers_attempted",
+                      "free_throws_made", "free_throws_attempted",
+                      "rebounds_offensive", "rebounds_defensive", "rebounds_total",
+                      "assists", "steals", "blocks", "turnovers", "fouls_personal", "points"], "Int64")
+    _coerce_cols(df, ["field_goals_percentage", "three_pointers_percentage",
+                      "free_throws_percentage", "plus_minus_points"])
 
     # --- tidy column order --------------------------------------------------
     front_cols = ["game_id", "team_id", "team_tricode", "team_city", "team_name",
@@ -292,9 +289,7 @@ def build_team_advanced(df: pd.DataFrame) -> pd.DataFrame:
         "rebounds_offensive", "rebounds_defensive", "rebounds_total",
         "assists", "steals", "blocks", "turnovers", "fouls_personal", "points",
     ]
-    for col in sum_cols:
-        if col in team_df.columns:
-            team_df[col] = pd.to_numeric(team_df[col], errors="coerce")
+    _coerce_cols(team_df, sum_cols)
 
     group_keys = ["game_id", "team_id", "team_city", "team_name", "team_tricode"]
     agg_df = (
@@ -318,9 +313,7 @@ def build_team_advanced(df: pd.DataFrame) -> pd.DataFrame:
     agg_df["oreb_pct_proxy"] = oreb / reb.replace(0, np.nan)
 
     # Cast integer columns
-    for col in sum_cols:
-        if col in agg_df.columns:
-            agg_df[col] = agg_df[col].astype("Int64")
+    _coerce_cols(agg_df, sum_cols, "Int64")
 
     return agg_df.sort_values(["game_id", "team_id"]).reset_index(drop=True)
 
@@ -395,6 +388,7 @@ def run_pipeline(
         dest = write_interim(df, f"{name}{suffix}.parquet")
         if verbose:
             print(f"  -> {dest.relative_to(PROJECT_ROOT)}")
+        log.info("%s%s: %d rows written", name, suffix, len(df))
 
     # --- display ------------------------------------------------------------
     if verbose:

@@ -38,14 +38,11 @@ Run from the project root::
 
 from __future__ import annotations
 
-import logging
 import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-
-log = logging.getLogger(__name__)
 
 # Decay rate for the exponential fatigue model (per day).
 # At λ=0.25 a game played 5 days ago contributes e^(-0.25) ≈ 22% of its original load;
@@ -68,20 +65,25 @@ ELO_HOME_ADV_MIN: float = 15.0     # floor: worst home team still gets this bonu
 ELO_MOV_BASELINE: float = 8.0
 # OT discount: ot_factor = 1 / (1 + num_ot × OT_DISCOUNT)
 ELO_OT_DISCOUNT: float = 0.1
+# Prior-season Elo carryover: fraction of a team's deviation from 1500 that carries over.
+# 0.55 → a team at 1600 starts the new season at 1555.
+ELO_CARRYOVER: float = 0.55
 
 _HERE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_HERE_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_HERE_PROJECT_ROOT))
 
 from src.utils.display import print_table  # noqa: E402
-from src.utils.io import PROJECT_ROOT, SEASON, read_interim, read_parquet, write_processed  # noqa: E402
+from src.utils.io import PROJECT_ROOT, SEASON, configure_logging, read_interim, read_parquet, write_processed  # noqa: E402
+
+log = configure_logging("features")
 
 
 # ---------------------------------------------------------------------------
 # Team features
 # ---------------------------------------------------------------------------
 
-def _load_prior_season_elo(carryover: float = 0.55) -> dict[int, float] | None:
+def _load_prior_season_elo(carryover: float = ELO_CARRYOVER) -> dict[int, float] | None:
     """Load each team's final Elo from the prior season and regress toward 1500.
 
     Prefers the playoffs snapshot (``elo_ratings_playoffs.parquet``) so carry-over
@@ -188,13 +190,26 @@ def compute_elo_ratings(
     log_baseline = np.log1p(mov_baseline)
 
     skipped: list[str] = []
+    neutral_site_count: int = 0
     # groupby with sort=False preserves the chronological order established above.
     for game_id, group in games.groupby("game_id", sort=False):
         home_row = group[group["is_home"]]
         away_row = group[~group["is_home"]]
+
+        neutral_site = False
         if home_row.empty or away_row.empty:
-            skipped.append(str(game_id))
-            continue
+            # Neutral-site game: both rows carry is_home=False (e.g. In-Season
+            # Tournament finals, Mexico City games).  Process with home_adv=0
+            # and do not count toward either team's home record.
+            if len(group) == 2 and home_row.empty:
+                home_row = group.iloc[[0]]
+                away_row = group.iloc[[1]]
+                neutral_site = True
+                neutral_site_count += 1
+            else:
+                skipped.append(str(game_id))
+                continue
+
         home = home_row.iloc[0]
         away = away_row.iloc[0]
 
@@ -205,9 +220,13 @@ def compute_elo_ratings(
         r_a = ratings.get(a_id, _fallback.get(a_id, initial))
 
         # Team-specific home advantage from prior home record (.500 prior for debut).
-        h_played = home_games.get(h_id, 0)
-        home_win_rate = home_wins.get(h_id, 0) / h_played if h_played > 0 else 0.5
-        home_adv = max(home_adv_min, home_adv_base + (home_win_rate - 0.5) * home_adv_scale)
+        # Neutral-site games get no home advantage.
+        if neutral_site:
+            home_adv = 0.0
+        else:
+            h_played = home_games.get(h_id, 0)
+            home_win_rate = home_wins.get(h_id, 0) / h_played if h_played > 0 else 0.5
+            home_adv = max(home_adv_min, home_adv_base + (home_win_rate - 0.5) * home_adv_scale)
 
         exp_h = 1.0 / (1.0 + 10.0 ** ((r_a - (r_h + home_adv)) / 400.0))
         s_h = 1.0 if bool(home["win"]) else 0.0
@@ -233,10 +252,17 @@ def compute_elo_ratings(
 
         ratings[h_id] = new_r_h
         ratings[a_id] = new_r_a
-        home_games[h_id] = h_played + 1
-        if s_h == 1.0:
-            home_wins[h_id] = home_wins.get(h_id, 0) + 1
+        if not neutral_site:
+            h_played = home_games.get(h_id, 0)
+            home_games[h_id] = h_played + 1
+            if s_h == 1.0:
+                home_wins[h_id] = home_wins.get(h_id, 0) + 1
 
+    if neutral_site_count:
+        log.info(
+            "compute_elo_ratings: processed %d neutral-site game(s) with home_adv=0",
+            neutral_site_count,
+        )
     if skipped:
         preview = ", ".join(skipped[:5]) + (" ..." if len(skipped) > 5 else "")
         log.warning(
@@ -338,18 +364,9 @@ def build_team_features(
     ]
     for col in avg_cols:
         if col in df.columns:
-            df[f"season_avg_{col}"] = (
-                df.groupby("team_id")[col]
-                .transform(lambda s: s.shift(1).expanding().mean())
-            )
-
-    # --- Last-10-game rolling averages (shift-1, prior 10 games only) -------
-    for col in avg_cols:
-        if col in df.columns:
-            df[f"last10_avg_{col}"] = (
-                df.groupby("team_id")[col]
-                .transform(lambda s: s.shift(1).rolling(10, min_periods=1).mean())
-            )
+            grouped = df.groupby("team_id")[col]
+            df[f"season_avg_{col}"] = grouped.transform(lambda s: s.shift(1).expanding().mean())
+            df[f"last10_avg_{col}"] = grouped.transform(lambda s: s.shift(1).rolling(10, min_periods=1).mean())
 
     # Season win rate before current game
     df["season_win_rate"] = (
@@ -702,7 +719,7 @@ def run_pipeline(
 
     prior_elo = _load_prior_season_elo()
     if verbose and prior_elo:
-        print(f"  prior-season Elo : loaded {len(prior_elo)} team ratings (45% regression toward 1500)")
+        print(f"  prior-season Elo : loaded {len(prior_elo)} team ratings ({(1 - ELO_CARRYOVER) * 100:.0f}% regression toward 1500)")
 
     outputs = compute_features_from_data(
         game_log, player_game_log, team_advanced, cutoff_date,
@@ -728,6 +745,7 @@ def run_pipeline(
             dest = write_processed(df, f"{name}{suffix}.parquet")
             if verbose:
                 print(f"  -> {dest.relative_to(PROJECT_ROOT)}")
+            log.info("%s%s: %d rows written", name, suffix, len(df))
 
         # Elo time series: one row per team per game.
         elo_ts = outputs["team_features"][
@@ -736,6 +754,17 @@ def run_pipeline(
         dest = write_processed(elo_ts, f"elo_ratings{suffix}.parquet")
         if verbose:
             print(f"  -> {dest.relative_to(PROJECT_ROOT)}")
+        log.info("elo_ratings%s: %d rows written", suffix, len(elo_ts))
+
+        tf = outputs["team_features"]
+        for src_col, delta_name in [
+            ("elo_pre", "elo_delta"),
+            ("team_fatigue", "fatigue_delta"),
+            ("h2h_win_rate", "h2h_delta"),
+        ]:
+            if src_col in tf.columns:
+                nan_rate = tf[src_col].isna().mean() * 100
+                log.info("NaN rate for %s (-> %s): %.2f%%", src_col, delta_name, nan_rate)
 
     if verbose and cutoff_date is None:
         print_table("team_features", outputs["team_features"])

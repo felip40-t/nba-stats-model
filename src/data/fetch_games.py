@@ -56,6 +56,7 @@ Examples
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 from pathlib import Path
@@ -72,6 +73,7 @@ from src.utils.io import (  # noqa: E402
     PROJECT_ROOT,
     RAW_DIR,
     SEASON,
+    configure_logging,
     read_parquet,
     season_api,
     write_parquet,
@@ -94,6 +96,8 @@ MAX_RETRIES: int = 3          # attempts per game before giving up
 RETRY_BACKOFF_BASE: float = 5.0  # seconds; doubles each attempt (5 → 10 → 20)
 COOLDOWN_EVERY: int = 200     # games between long pauses
 COOLDOWN_SECONDS: float = 30.0   # pause duration to let the rate-limit window reset
+
+log = configure_logging("fetch_games")
 
 
 # ---------------------------------------------------------------------------
@@ -183,14 +187,16 @@ def _existing_game_ids(boxscore_path: Path) -> set[str]:
         import pyarrow.parquet as pq
 
         schema = pq.read_schema(boxscore_path)
-        if "gameId" not in schema.names:
+        col = next((c for c in ("gameId", "game_id", "GAME_ID") if c in schema.names), None)
+        if col is None:
             return set()
-        table = pq.read_table(boxscore_path, columns=["gameId"])
-        return {str(v) for v in table.column("gameId").to_pylist() if v is not None}
+        table = pq.read_table(boxscore_path, columns=[col])
+        return {str(v) for v in table.column(col).to_pylist() if v is not None}
     except Exception:  # fall back to full read on unexpected schema/engine issues
         df = read_parquet(boxscore_path)
-        if "gameId" in df.columns:
-            return set(df["gameId"].astype(str).unique())
+        for col in ("gameId", "game_id", "GAME_ID"):
+            if col in df.columns:
+                return set(df[col].astype(str).unique())
         return set()
 
 
@@ -261,6 +267,8 @@ def run(
     target_game_ids = get_game_ids(gamelog_df)
     new_game_ids = [g for g in target_game_ids if g not in existing_ids]
     print(f"  Target games: {len(target_game_ids)}")
+    log.info("New game IDs to fetch: %d", len(new_game_ids))
+    log.info("Skipped (already on disk): %d game IDs", len(existing_ids))
 
     # Merge new gamelog rows with existing ones so --update runs accumulate.
     if update and gamelog_path.exists():
@@ -357,6 +365,7 @@ def run(
             f"{len(new_game_ids) - len(failed)} new games) "
             f"to {boxscore_path.relative_to(PROJECT_ROOT)}"
         )
+        log.info("Total box score rows written: %d", total_rows)
 
     if failed:
         preview = ", ".join(failed[:5]) + (" ..." if len(failed) > 5 else "")

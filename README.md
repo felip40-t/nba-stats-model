@@ -14,7 +14,7 @@ The target milestone is **working software ready for the 2026 NBA playoffs**.
 
 ## Current Status
 
-**Version 2.2.0** — Added XGBoost as a second model alongside logistic regression. Both models share the same data pipeline and rolling simulation. `train.py` and `evaluate.py` accept a `--model {logreg,xgboost}` flag; outputs are organised by model name. XGBoost is set up with a `XGBOOST_DEFAULT_PARAMS` constant ready for hyperparameter tuning. See [Roadmap](#roadmap) for what is still to be done.
+**Version 2.4.0** — Infrastructure and Elo improvements: centralized structured logging to daily files in `logs/`; dark-theme plotting extracted to `src/utils/style.py` with full NBA team colors; outputs are now season-scoped (`outputs/{SEASON}/`); `SEASON` can be overridden via `NBA_SEASON` env var without editing code; neutral-site games (IST finals, Mexico City) processed with `home_adv=0` instead of skipped; `evaluate.py` gains `--output-json` flag; `elo_all_teams.png` now plots the top-10 teams by final rating; Elo hyperparameters retuned. See [Roadmap](#roadmap) for what is still to be done.
 
 | Stage | Status |
 |---|---|
@@ -36,7 +36,13 @@ The target milestone is **working software ready for the 2026 NBA playoffs**.
 | Feature importance + collinearity analysis tools | Done |
 | Test suite (pytest smoke tests for process, features, train) | Done |
 | XGBoost model (alongside logistic regression) | Done |
-| XGBoost hyperparameter tuning | Pending |
+| XGBoost hyperparameter tuning (`xgboost_grid_search.py`) | Done |
+| XGBoost full feature set (`XGBOOST_MODEL_FEATURES`, 50+ deltas) | Done |
+| Neutral-site Elo handling (IST finals, Mexico City games) | Done |
+| Centralized structured logging → `logs/pipeline_<date>.log` | Done |
+| Shared dark-theme plotting utilities (`src/utils/style.py`, NBA team colors) | Done |
+| Season-scoped output paths (`outputs/{SEASON}/`) + `NBA_SEASON` env var | Done |
+| `evaluate.py --output-json` (writes `latest_metrics.json`) | Done |
 
 ---
 
@@ -121,7 +127,7 @@ The home-court bonus `H` is **team-specific**, scaling with the home team's prio
 H = max(HOME_ADV_MIN, HOME_ADV_BASE + (home_win_rate − 0.5) × HOME_ADV_SCALE)
 ```
 
-A team with a strong home record earns a larger bonus; the worst home teams are floored at `HOME_ADV_MIN`. Current defaults: `HOME_ADV_BASE = 40`, `HOME_ADV_SCALE = 10`, `HOME_ADV_MIN = 20` — tuned via `elo_grid_search.py`.
+A team with a strong home record earns a larger bonus; the worst home teams are floored at `HOME_ADV_MIN`. Neutral-site games (identified by both rows carrying `is_home=False`) receive `home_adv=0` and do not count toward either team's home record. Current defaults: `HOME_ADV_BASE = 40`, `HOME_ADV_SCALE = 5`, `HOME_ADV_MIN = 15` — tuned via `elo_grid_search.py`.
 
 #### Fatigue Metrics (player-level)
 
@@ -161,9 +167,13 @@ Dates with fewer than `min_train_games` (default 50) complete training rows are 
 | Model | Flag | Description |
 |---|---|---|
 | Logistic regression | `--model logreg` (default) | `StandardScaler + LogisticRegression` sklearn pipeline |
-| XGBoost | `--model xgboost` | `XGBClassifier` with defaults in `XGBOOST_DEFAULT_PARAMS`; ready for hyperparameter tuning |
+| XGBoost | `--model xgboost` | `XGBClassifier` with hyperparameters tuned via `xgboost_grid_search.py`; best params stored in `XGBOOST_DEFAULT_PARAMS` |
 
-**Active model inputs** (`MODEL_FEATURES` — home − away deltas):
+**Feature lists (home − away deltas):**
+
+Two separate feature lists are maintained. Logistic regression uses a short, regularised set; XGBoost uses the full delta set computed by `compute_deltas()`.
+
+`MODEL_FEATURES` (logistic regression — 5 features):
 
 | Feature | Description |
 |---|---|
@@ -173,7 +183,7 @@ Dates with fewer than `min_train_games` (default 50) complete training rows are 
 | `acwr_delta` | Team Acute:Chronic Workload Ratio |
 | `h2h_delta` | Head-to-head win rate between these two teams |
 
-`compute_deltas()` computes the full set of 50+ home-minus-away delta columns (season-to-date averages, efficiency metrics, defensive metrics, recent form, win streak, last-10 rolling averages) — these are available in the game table for experimentation but are not currently included in `MODEL_FEATURES`. Use `tests/model_tests.py` to analyse which features are most informative.
+`XGBOOST_MODEL_FEATURES` (XGBoost — 50+ features): the full set of home-minus-away deltas computed by `compute_deltas()`, covering season averages, efficiency, rebounding, playmaking, defensive metrics, recent form, win streak, fatigue, head-to-head, and 23 last-10-game rolling stats. Use `tests/model_tests.py` to analyse feature importance and collinearity.
 
 **Outputs** (model name is substituted for `{model}`):
 
@@ -205,7 +215,7 @@ Loads the rolling predictions and saved model for the selected `--model`, prints
 | File | Description |
 |---|---|
 | `elo_time_series.png` | Per-team Elo rating progression — small multiples (one panel per team) |
-| `elo_all_teams.png` | All 30 teams' Elo ratings overlaid on a single chart |
+| `elo_all_teams.png` | Top-10 teams by final Elo rating on a single chart, each coloured by franchise; all plotted teams labelled at the end of their line |
 
 ---
 
@@ -228,9 +238,7 @@ The items below are planned for future versions, roughly in priority order.
 
 ### Model inputs
 
-- **Re-expand MODEL_FEATURES** — use `tests/feature_tests.py` (L1 sweep, permutation importance, ablation, VIF) to identify which of the 50+ computed deltas contribute signal, then add the survivors back to `MODEL_FEATURES`
 - **Calibration post-processing** — Platt scaling or isotonic regression on rolling predictions
-- **XGBoost hyperparameter tuning** — grid or random search over `XGBOOST_DEFAULT_PARAMS` (n_estimators, max_depth, learning_rate, subsample, colsample_bytree, etc.)
 
 ### Player features
 
@@ -239,31 +247,37 @@ The items below are planned for future versions, roughly in priority order.
 - **Injury and rest context** — extended days-off tracking, returning-from-absence flags
 - **Rotation stability** — variance in recent minutes as a proxy for role certainty
 
-### Infrastructure
-
-- Automated full-season pipeline runner with progress logging
-
 ---
 
 ## Tunable Constants
 
 | Constant | File | Default | Purpose |
 |---|---|---|---|
-| `SEASON` | `src/utils/io.py` | `"2025"` | Active season; controls all data paths |
+| `SEASON` | `src/utils/io.py` | `"2025"` (Python) / `"2026"` (Makefile) | Active season; controls all data paths. Override via `NBA_SEASON` env var |
 | `API_DELAY` | `src/data/fetch_games.py` | `0.6` s | Delay between `nba_api` calls for small runs |
 | `BULK_API_DELAY` | `src/data/fetch_games.py` | `1.0` s | Delay used when fetching > 100 new games |
 | `CHECKPOINT_EVERY` | `src/data/fetch_games.py` | `100` | Games between intermediate box-score saves |
 | `COOLDOWN_EVERY` | `src/data/fetch_games.py` | `200` | Games between long cooldown pauses |
 | `COOLDOWN_SECONDS` | `src/data/fetch_games.py` | `30.0` s | Duration of each cooldown pause |
-| `FATIGUE_LAMBDA` | `src/data/features.py` | `0.2` | Decay rate for exponential fatigue model (day⁻¹) |
+| `FATIGUE_LAMBDA` | `src/data/features.py` | `0.25` | Decay rate for exponential fatigue model (day⁻¹) |
 | `ELO_INITIAL` | `src/data/features.py` | `1500.0` | Starting Elo for all teams |
 | `ELO_K` | `src/data/features.py` | `25.0` | Elo K-factor (base update step size) |
 | `ELO_HOME_ADV_BASE` | `src/data/features.py` | `40.0` | Elo home-court bonus for a .500 home record |
-| `ELO_HOME_ADV_SCALE` | `src/data/features.py` | `10.0` | Sensitivity of home-court bonus to home win rate |
-| `ELO_HOME_ADV_MIN` | `src/data/features.py` | `20.0` | Floor for worst home-record teams |
+| `ELO_HOME_ADV_SCALE` | `src/data/features.py` | `5.0` | Sensitivity of home-court bonus to home win rate |
+| `ELO_HOME_ADV_MIN` | `src/data/features.py` | `15.0` | Floor for worst home-record teams |
 | `ELO_MOV_BASELINE` | `src/data/features.py` | `8.0` | Point margin yielding a MOV multiplier of 1.0 (≈ median NBA win margin) |
-| `ELO_OT_DISCOUNT` | `src/data/features.py` | `0.2` | K reduction per OT period: `ot_factor = 1 / (1 + num_ot × discount)` |
+| `ELO_OT_DISCOUNT` | `src/data/features.py` | `0.1` | K reduction per OT period: `ot_factor = 1 / (1 + num_ot × discount)` |
+| `ELO_CARRYOVER` | `src/data/features.py` | `0.55` | Fraction of prior-season Elo deviation from 1500 that carries over |
 | `min_train_games` | `src/models/train.py` | `50` | Minimum training rows before rolling predictions begin |
+| `XGBOOST_DEFAULT_PARAMS.n_estimators` | `src/models/train.py` | `100` | Number of XGBoost trees |
+| `XGBOOST_DEFAULT_PARAMS.max_depth` | `src/models/train.py` | `4` | Maximum tree depth |
+| `XGBOOST_DEFAULT_PARAMS.learning_rate` | `src/models/train.py` | `0.03` | Step size shrinkage |
+| `XGBOOST_DEFAULT_PARAMS.subsample` | `src/models/train.py` | `0.7` | Row subsampling ratio per tree |
+| `XGBOOST_DEFAULT_PARAMS.colsample_bytree` | `src/models/train.py` | `0.7` | Column subsampling ratio per tree |
+| `XGBOOST_DEFAULT_PARAMS.min_child_weight` | `src/models/train.py` | `5` | Minimum sum of instance weight in a leaf |
+| `XGBOOST_DEFAULT_PARAMS.gamma` | `src/models/train.py` | `0.0` | Minimum loss reduction required to split a node |
+| `XGBOOST_DEFAULT_PARAMS.reg_alpha` | `src/models/train.py` | `0.1` | L1 regularisation |
+| `XGBOOST_DEFAULT_PARAMS.reg_lambda` | `src/models/train.py` | `0.75` | L2 regularisation |
 
 ---
 
@@ -272,10 +286,10 @@ The items below are planned for future versions, roughly in priority order.
 ```text
 nba-stats-model/
 │
-├─ CLAUDE.md
 ├─ README.md
 ├─ pyproject.toml                   ← build system, pytest config, ruff config
 ├─ requirements.txt
+├─ Makefile                         ← convenience targets (see Common Commands)
 ├─ .gitignore
 │
 ├─ data/
@@ -293,11 +307,13 @@ nba-stats-model/
 │   ├─ models/
 │   │   ├─ train.py                 ← Stage 4: rolling training simulation + playoffs model
 │   │   ├─ evaluate.py             ← Stage 5: evaluation and diagnostic plots
-│   │   └─ elo_grid_search.py      ← Grid search over Elo hyperparameters (standalone)
+│   │   ├─ elo_grid_search.py      ← Grid search over Elo hyperparameters (standalone)
+│   │   └─ xgboost_grid_search.py  ← Grid search over XGBoost hyperparameters (standalone)
 │   │
 │   └─ utils/
-│       ├─ io.py                    ← shared path constants and Parquet helpers
-│       └─ display.py               ← CLI table-printing helper (print_table)
+│       ├─ io.py                    ← shared path constants, Parquet helpers, configure_logging()
+│       ├─ display.py               ← CLI table-printing helper (print_table)
+│       └─ style.py                 ← dark-theme plotting constants, NBA team colors, helpers
 │
 ├─ tests/
 │   ├─ conftest.py                  ← adds project root to sys.path for pytest
@@ -307,12 +323,14 @@ nba-stats-model/
 │   ├─ feature_tests.py             ← feature analysis utilities: L1 sweep, permutation importance, ablation, VIF
 │   └─ model_tests.py               ← script: run feature_tests against the trained model on disk
 │
+├─ logs/                            ← daily pipeline log files (pipeline_<YYYYMMDD>.log)
 └─ outputs/
-    ├─ models/                      ← fitted models + rolling predictions (named by model type)
-    └─ figures/
-        ├─ logreg/                  ← logreg-specific diagnostic plots
-        ├─ xgboost/                 ← xgboost-specific diagnostic plots
-        └─ (root)                   ← model-agnostic Elo plots
+    └─ 2026/                        ← season-scoped (controlled by NBA_SEASON env var)
+        ├─ models/                  ← fitted models + rolling predictions (named by model type)
+        └─ figures/
+            ├─ logreg/              ← logreg-specific diagnostic plots
+            ├─ xgboost/             ← xgboost-specific diagnostic plots
+            └─ (root)               ← model-agnostic Elo plots
 ```
 
 ---
@@ -363,6 +381,15 @@ python src/models/elo_grid_search.py
 # Results saved to outputs/models/elo_grid_search_results.parquet
 ```
 
+**Optional — XGBoost hyperparameter grid search:**
+
+```bash
+# Chronological holdout search (65% train / 35% test) over n_estimators, max_depth,
+# learning_rate, subsample, colsample_bytree, min_child_weight, gamma, reg_lambda
+python src/models/xgboost_grid_search.py
+# Results saved to outputs/models/xgboost_grid_search_results.parquet
+```
+
 **Common flags:**
 
 ```bash
@@ -386,9 +413,13 @@ python src/models/train.py --model xgboost --playoffs
 
 # Raise the cold-start threshold (default 50)
 python src/models/train.py --min-train-games 100
+
+# Write evaluation metrics to outputs/{SEASON}/models/latest_metrics.json
+python src/models/evaluate.py --output-json
+python src/models/evaluate.py --model xgboost --output-json
 ```
 
-The active season is controlled by `SEASON` in `src/utils/io.py`. Changing it to a new year automatically reroutes all data paths.
+The active season is controlled by `SEASON` in `src/utils/io.py` (default `"2025"`). Override it without editing code via the `NBA_SEASON` env var — e.g. `NBA_SEASON=2026 make pipeline` or `NBA_SEASON=2026 python src/data/fetch_games.py`. Outputs are written to `outputs/{SEASON}/`.
 
 **Run the test suite:**
 

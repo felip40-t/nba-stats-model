@@ -14,7 +14,6 @@ Run from the project root::
 from __future__ import annotations
 
 import itertools
-import logging
 import sys
 from pathlib import Path
 
@@ -23,25 +22,20 @@ import pandas as pd
 from sklearn.metrics import log_loss
 from xgboost import XGBClassifier
 
-logging.basicConfig(
-    format="%(asctime)s %(levelname)-8s %(message)s",
-    level=logging.INFO,
-    datefmt="%H:%M:%S",
-)
-log = logging.getLogger(__name__)
-
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from src.utils.display import print_table
-from src.utils.io import OUTPUTS_DIR, PROJECT_ROOT, read_processed, read_schedule, write_parquet
+from src.utils.io import OUTPUTS_DIR, PROJECT_ROOT, configure_logging, read_processed, read_schedule, write_parquet
 from src.models.train import (
-    MODEL_FEATURES,
+    XGBOOST_MODEL_FEATURES,
     build_game_rows,
     compute_deltas,
     drop_missing,
 )
+
+log = configure_logging("xgboost_grid_search")
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -63,14 +57,14 @@ FIXED_PARAMS: dict = {
 # Parameters to search.  Each key maps to a list of candidate values.
 # Total combinations = product of all list lengths.
 GRID: dict[str, list] = {
-    "n_estimators":     [50, 100, 150],
+    "n_estimators":     [100, 200, 300, 400],
     "max_depth":        [2, 3, 4],
     "learning_rate":    [0.01, 0.02, 0.03],
-    "subsample":        [0.75, 0.8, 0.85],
+    "subsample":        [0.7, 0.8],
     "colsample_bytree": [0.7],
     "min_child_weight": [4, 5, 6],
-    "gamma":            [0.05, 0.1, 0.15],
-    "reg_alpha":        [0.0],
+    "gamma":            [0.0, 0.1, 0.2],
+    "reg_alpha":        [0.0, 0.1],
     "reg_lambda":       [0.75, 1.0, 1.25],
 }
 
@@ -94,9 +88,9 @@ def _evaluate(
     if len(train) == 0 or len(test) == 0:
         return float("nan")
 
-    X_train = train[MODEL_FEATURES]
+    X_train = train[XGBOOST_MODEL_FEATURES]
     y_train = train["home_win"]
-    X_test  = test[MODEL_FEATURES]
+    X_test  = test[XGBOOST_MODEL_FEATURES]
     y_test  = test["home_win"]
 
     model = XGBClassifier(**params, **FIXED_PARAMS)
@@ -121,7 +115,7 @@ def main() -> None:
     log.info("Building game rows and computing deltas ...")
     games = build_game_rows(team_features, schedule)
     games = compute_deltas(games)
-    games = drop_missing(games)
+    games = drop_missing(games, features=XGBOOST_MODEL_FEATURES)
     log.info("  complete game rows : %d", len(games))
 
     split_idx = int(len(games.sort_values("game_date")) * TRAIN_FRACTION)
@@ -129,7 +123,7 @@ def main() -> None:
         "Holdout split: train=%d games, test=%d games (TRAIN_FRACTION=%.2f)",
         split_idx, len(games) - split_idx, TRAIN_FRACTION,
     )
-    log.info("Model features (%d): %s", len(MODEL_FEATURES), MODEL_FEATURES)
+    log.info("Model features (%d): %s", len(XGBOOST_MODEL_FEATURES), XGBOOST_MODEL_FEATURES)
 
     keys   = list(GRID.keys())
     combos = list(itertools.product(*[GRID[k] for k in keys]))

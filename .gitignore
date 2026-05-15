@@ -8,3 +8,7 @@ outputs/
 .pytest_cache/
 *.egg-info/
 .mypy_cache/
+logs/*.log
+logs/*.json
+logs/*.jsonl
+docs/

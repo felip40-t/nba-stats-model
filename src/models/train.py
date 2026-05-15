@@ -82,10 +82,9 @@ _HERE_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_HERE_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_HERE_PROJECT_ROOT))
 
-from src.utils.io import MODELS_DIR, PROJECT_ROOT, read_processed, read_schedule  # noqa: E402
+from src.utils.io import MODELS_DIR, PROJECT_ROOT, configure_logging, read_processed, read_schedule, write_parquet  # noqa: E402
 
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
-log = logging.getLogger(__name__)
+log = configure_logging("train")
 
 # Stats for which both a season-to-date average and a 10-game rolling average
 # are computed in features.py.  Used to auto-generate _TEAM_FEATURE_COLS entries
@@ -140,16 +139,60 @@ MODEL_FEATURES = [
     "h2h_delta",
 ]
 
+XGBOOST_MODEL_FEATURES = [
+    # Elo & home advantage
+    "elo_delta",
+    "home_adv",
+    # Season win rate
+    "win_rate_delta",
+    # Scoring & efficiency
+    "pts_delta",
+    "fg_pct_delta",
+    "fg3_pct_delta",
+    "ft_pct_delta",
+    "fta_delta",
+    "true_shooting_pct_delta",
+    "three_point_rate_delta",
+    "free_throw_rate_delta",
+    # Rebounding
+    "reb_delta",
+    "oreb_delta",
+    "oreb_pct_proxy_delta",
+    "true_oreb_pct_delta",
+    # Playmaking & defence
+    "ast_delta",
+    "stl_delta",
+    "blk_delta",
+    "tov_delta",
+    "pf_delta",
+    # Opponent defensive metrics
+    "opp_pts_delta",
+    "opp_oreb_delta",
+    "opp_oreb_pct_delta",
+    "opp_blk_delta",
+    "opp_stl_delta",
+    # Recent form
+    "recent_form_5_delta",
+    "recent_form_10_delta",
+    "recent_form_15_delta",
+    "win_streak_delta",
+    # Fatigue
+    "fatigue_delta",
+    "acwr_delta",
+    # Head-to-head
+    "h2h_delta",
+] + [f"last10_{c}_delta" for c in _LAST10_STATS]
+
 XGBOOST_DEFAULT_PARAMS: dict = {
     "n_estimators": 100,
-    "max_depth": 3,
+    "max_depth": 4,
     "learning_rate": 0.03,
-    "subsample": 0.8,
+    "subsample": 0.7,
     "colsample_bytree": 0.7,
     "min_child_weight": 5,
-    "gamma": 0.1,
-    "reg_alpha": 0.0,
-    "reg_lambda": 1.0,
+    "gamma": 0.0,
+    "reg_alpha": 0.1,
+    "reg_lambda": 0.75,
     "objective": "binary:logistic",
     "eval_metric": "logloss",
     "random_state": 42,
@@ -248,7 +291,7 @@ def compute_deltas(games: pd.DataFrame) -> pd.DataFrame:
     return games
 
 
-def drop_missing(games: pd.DataFrame) -> pd.DataFrame:
+def drop_missing(games: pd.DataFrame, features: list[str] | None = None) -> pd.DataFrame:
     """Drop rows where any model feature is NaN.
 
     Logs at INFO rather than DEBUG so a silent data bug is immediately visible
@@ -256,12 +299,13 @@ def drop_missing(games: pd.DataFrame) -> pd.DataFrame:
     several games of history); an unexpectedly large drop later in the season
     usually means upstream data is missing.
     """
+    features = features if features is not None else MODEL_FEATURES
     before = len(games)
-    nan_mask = games[MODEL_FEATURES + ["home_win"]].isna().any(axis=1)
+    nan_mask = games[features + ["home_win"]].isna().any(axis=1)
     dropped = nan_mask.sum()
     if dropped:
         nan_counts = (
-            games.loc[nan_mask, MODEL_FEATURES]
+            games.loc[nan_mask, features]
             .isna().sum()
             .pipe(lambda s: s[s > 0])
             .sort_values(ascending=False)
@@ -294,7 +338,7 @@ def train_logreg(train: pd.DataFrame) -> Pipeline:
 
 def train_xgboost(train: pd.DataFrame) -> XGBClassifier:
     """Fit an XGBClassifier on the given game rows."""
-    X_train = train[MODEL_FEATURES]
+    X_train = train[XGBOOST_MODEL_FEATURES]
     y_train = train["home_win"]
     model = XGBClassifier(**XGBOOST_DEFAULT_PARAMS)
     model.fit(X_train, y_train)
@@ -309,6 +353,7 @@ def build_rolling_predictions(
     games: pd.DataFrame,
     min_train_games: int = 50,
     train_fn: Callable[[pd.DataFrame], Any] = train_logreg,
+    features: list[str] | None = None,
 ) -> pd.DataFrame:
     """Simulate the model predicting each game using only prior data.
 
@@ -340,6 +385,7 @@ def build_rolling_predictions(
         ``home_team_id``, ``away_team_id``, ``home_win``,
         ``predicted_proba``, ``predicted_label``.
     """
+    _features = features if features is not None else MODEL_FEATURES
     # Work in Timestamp space (faster than Python ``datetime.date`` and avoids
     # per-row object conversion every iteration).  ``normalize()`` zeroes the
     # time-of-day component so same-day games collapse cleanly.
@@ -357,8 +403,8 @@ def build_rolling_predictions(
             continue
 
         model = train_fn(train)
-        proba = model.predict_proba(today[MODEL_FEATURES])[:, 1]
-        pred_label = model.predict(today[MODEL_FEATURES])
+        proba = model.predict_proba(today[_features])[:, 1]
+        pred_label = model.predict(today[_features])
 
         pred_df = today[["game_id", "game_date", "home_team_id", "away_team_id", "home_win"]].copy()
         pred_df["predicted_proba"] = proba
@@ -413,6 +459,7 @@ def main(argv: list[str] | None = None) -> None:
         "xgboost": train_xgboost,
     }
     train_fn = _TRAIN_FN[args.model]
+    features = XGBOOST_MODEL_FEATURES if args.model == "xgboost" else MODEL_FEATURES
 
     # ------------------------------------------------------------------
     # Load processed features (written by features.py).
@@ -433,8 +480,14 @@ def main(argv: list[str] | None = None) -> None:
     log.info("Building game rows and computing deltas ...")
     games = build_game_rows(team_features, schedule)
     games = compute_deltas(games)
-    games = drop_missing(games)
+    games = drop_missing(games, features=features)
     log.info("  complete game rows : %d", len(games))
+    if len(games) > 0:
+        log.info(
+            "Training data date range: %s to %s",
+            games["game_date"].min().date(),
+            games["game_date"].max().date(),
+        )
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -462,11 +515,12 @@ def main(argv: list[str] | None = None) -> None:
             games,
             min_train_games=args.min_train_games,
             train_fn=train_fn,
+            features=features,
         )
         log.info("  predictions collected : %d", len(rolling_preds))
 
         pred_path = MODELS_DIR / f"rolling_predictions_{args.model}.parquet"
-        rolling_preds.to_parquet(pred_path, index=False)
+        write_parquet(rolling_preds, pred_path)
         log.info("Rolling predictions saved → %s", pred_path.relative_to(PROJECT_ROOT))
 
         log.info("Training final model on full season (%d games) ...", len(games))
